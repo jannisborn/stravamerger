@@ -1,0 +1,5 @@
+typer
+gpxpy
+requests
+loguru
+tqdm
