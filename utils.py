@@ -1,5 +1,7 @@
+from dataclasses import dataclass
 from datetime import datetime
 from math import atan2, cos, radians, sin, sqrt
+from typing import Optional, Tuple
 
 import gpxpy.gpx
 
@@ -36,17 +38,25 @@ def parse_date(date_str: str) -> datetime.date:
     return datetime.fromisoformat(date_str).date()
 
 
+@dataclass
+class Activity:
+    name: str
+    id: int
+    start_date: str
+    start_coords: Tuple[float, float]
+    filepath: Optional[str] = None
+    sport: Optional[str] = None
+    description: str = ""
+    url: Optional[str] = None
+
+
 class CustomGPX(gpxpy.gpx.GPX):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.filepath = None
-        self.sport = None
+        self.activity = None
 
-    def set_filepath(self, filepath: str):
-        self.filepath = filepath
-
-    def set_sport(self, sport: str):
-        self.sport = sport
+    def set_activity(self, activity: Activity):
+        self.activity = activity
 
 
 NAME_DICT = {

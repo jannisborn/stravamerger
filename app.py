@@ -3,31 +3,17 @@ import os
 import smtplib
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import gpxpy.gpx
 import requests
 from gpxpy.gpx import GPXTrack, GPXTrackSegment
 from loguru import logger
 from tqdm import tqdm
-
-from utils import NAME_DICT, CustomGPX, haversine, parse_date
-
-TODAY = datetime.today().strftime("%Y-%m-%d")
-
-
-@dataclass
-class Activity:
-    name: str
-    id: int
-    start_date: str
-    start_coords: Tuple[float, float]
-    filepath: Optional[str] = None
-    sport: Optional[str] = None
+from utils import NAME_DICT, Activity, CustomGPX, haversine, parse_date
 
 
 class StravaMerger:
@@ -36,22 +22,24 @@ class StravaMerger:
     ACTIVITIES_WEBURL = "https://www.strava.com/activities/"
     STREAM_URL_TEMPLATE = "https://www.strava.com/api/v3/activities/{}/streams"
     UPLOAD_URL = "https://www.strava.com/api/v3/uploads"
-    SENDER_MAIL = "jannis.born@gmail.com"
+
     DELETE_BODY = """<html><head></head><body><p>Here are the Strava activities to be deleted:</p><ul>"""
     CONFIRM_BODY = (
         """<html><head></head><body><p>Here are the new Strava activities:</p><ul>"""
     )
 
-    def __init__(self, secret_path: str, dist_theta: float = 1000.0):
+    def __init__(self, secret_path: str, sender_mail: str, dist_theta: float = 1000.0):
         """
         Initializes the StravaMerger with the necessary credentials.
 
         Args:
             secret_path: Path to the JSON file containing the credentials.
+            sender_mail: Email address of the sender.
             dist_theta: Distance threshold for merging activities.
         """
 
         self.dist_theta = dist_theta
+        self.sender_mail = sender_mail
 
         with open("secret.json", "r") as f:
             secret = json.load(f)
@@ -60,8 +48,18 @@ class StravaMerger:
         self.client_secret = secret["client_secret"]
         self.access_token = secret["access_token"]
         self.refresh_token = secret["refresh_token"]
-        self.authorization_code = secret["authorization_code"]
         self.mail_password = secret["mail"]
+
+    @staticmethod
+    def check_rate_limit(response: requests.Response):
+        """
+        Raises if the rate limit has been exceeded.
+
+        Args:
+            response (requests.Response): The response from the Strava API.
+        """
+        if isinstance(response, dict) and response["message"] == "Rate Limit Exceeded":
+            raise ValueError("Rate Limit Exceeded")
 
     def get_stream_url(self, activity_id: int) -> str:
         """
@@ -89,6 +87,7 @@ class StravaMerger:
         }
 
         response = requests.post(self.AUTH_URL, data=payload, verify=False)
+        self.check_rate_limit(response)
         new_token = response.json().get("access_token")
         logger.info("Access Token = {}\n".format(new_token))
 
@@ -117,11 +116,7 @@ class StravaMerger:
                 response = requests.get(
                     self.ACTIVITIES_URL, headers=header, params=params
                 ).json()
-                if (
-                    isinstance(response, dict)
-                    and response["message"] == "Rate Limit Exceeded"
-                ):
-                    raise ValueError("Rate Limit Exceeded")
+                self.check_rate_limit(response)
                 fetched = len(response)
                 pbar.update(min(fetched, num_activities - len(activities)))
                 activities.extend(response)
@@ -174,33 +169,31 @@ class StravaMerger:
                     logger.info(
                         f"No match found between {activity['id']} ({activity['name']}) and {other_activity['id']}"
                         + f"({other_activity['name']}), distance was {dist}. Links: "
-                        + f"{os.path.join(self.ACTIVITIES_URL, str(activity['id']))} and "
-                        + f"{os.path.join(self.ACTIVITIES_URL, str(other_activity['id']))}"
+                        + f"{os.path.join(self.ACTIVITIES_WEBURL, str(activity['id']))} and "
+                        + f"{os.path.join(self.ACTIVITIES_WEBURL, str(other_activity['id']))}"
                     )
 
         return matches
 
-    def activity_to_gpx(
-        self, activity_id: int, sport: str, start_time: str = None
-    ) -> CustomGPX:
+    def activity_to_gpx(self, activity: Activity) -> CustomGPX:
         """
         Fetches activity streams (lat-long, time, altitude) for a given activity ID from Strava.
 
         Args:
-            activity_id (int): The ID of the activity for which to retrieve the stream.
-            sport (str): The sport type of the activity.
-            start_time (str): The start time of the activity in ISO format.
+            activity (Activity): Activity object containing e.g., Strava ID, name, sport type
+                and start time in ISO format.
 
         Returns:
             CustomGPX: The GPX object representing the activity.
         """
 
         header = {"Authorization": "Bearer " + self.access_token}
-        stream_url = self.get_stream_url(activity_id)
+        stream_url = self.get_stream_url(activity.id)
 
         # Fetch each data stream separately and handle the potential absence of any data stream
         def get_stream_data(key):
             response = requests.get(stream_url, headers=header, params={"keys": [key]})
+            self.check_rate_limit(response)
             idx = 0 if key in ["latlng", "temp"] else 1
 
             if response.status_code == 200 and key in [
@@ -217,7 +210,7 @@ class StravaMerger:
                     )
             else:
                 logger.warning(
-                    f"Could not fetch {key} stream for activity {activity_id}"
+                    f"Could not fetch {key} stream for activity {activity.id}"
                 )
                 stream = [None] * len(latlong)
 
@@ -235,8 +228,8 @@ class StravaMerger:
         gpx.tracks.append(gpx_track)
         gpx_segment = gpxpy.gpx.GPXTrackSegment()
         gpx_track.segments.append(gpx_segment)
-        start_time = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ")
-        gpx.set_sport(sport)
+        start_time = datetime.strptime(activity.start_date, "%Y-%m-%dT%H:%M:%SZ")
+        gpx.set_activity(activity)
 
         for i, (lat, lon) in enumerate(latlong):
             point = gpxpy.gpx.GPXTrackPoint(
@@ -279,27 +272,21 @@ class StravaMerger:
                     f"Processing activity pair {i+1}/{len(acts_to_merge)}: {a1.id} and {a2.id}"
                 )
                 pbar.update(1)
-                gpx1 = self.activity_to_gpx(
-                    a1.id, start_time=a1.start_date, sport=a1.sport
-                )
-                gpx2 = self.activity_to_gpx(
-                    a2.id, start_time=a2.start_date, sport=a2.sport
-                )
-
+                gpx1, gpx2 = self.activity_to_gpx(a1), self.activity_to_gpx(a2)
                 gpxs.append((gpx1, gpx2))
 
         return gpxs
 
-    def merge_gpx(self, gpx1: gpxpy.gpx.GPX, gpx2: gpxpy.gpx.GPX) -> gpxpy.gpx.GPX:
+    def merge_gpx(self, gpx1: CustomGPX, gpx2: CustomGPX) -> CustomGPX:
         """
         Merges two GPX objects into one in the order of their starting times.
 
         Args:
-            gpx1 (gpxpy.gpx.GPX): The first GPX object.
-            gpx2 (gpxpy.gpx.GPX): The second GPX object.
+            gpx1 (CustomGPX): The first GPX object.
+            gpx2 (CustomGPX): The second GPX object.
 
         Returns:
-            gpxpy.gpx.GPX: The merged GPX object in chronological order.
+            CustomGPX: The merged GPX object in chronological order.
         """
         # Find the starting times of each GPX track
         start_time1 = (
@@ -322,7 +309,6 @@ class StravaMerger:
         merged_gpx = CustomGPX()
         merged_track = GPXTrack()
         merged_segment = GPXTrackSegment()
-        merged_gpx.set_sport(first_gpx.sport)
 
         # Function to add points from a track to the merged segment
         def add_points_from_track(gpx):
@@ -340,11 +326,20 @@ class StravaMerger:
 
         return merged_gpx
 
-    def __call__(self, to_merge_gpx: List) -> List[gpxpy.gpx.GPX]:
+    def __call__(
+        self,
+        to_merge_gpx: List[Tuple[CustomGPX, CustomGPX]],
+        new_activities: List[Activity],
+    ) -> List[CustomGPX]:
         """Merges pairs of activities into one activity."""
+        assert len(to_merge_gpx) == len(
+            new_activities
+        ), f"{len(to_merge_gpx)} != {len(new_activities)}"
+
         merged = []
-        for gpx1, gpx2 in to_merge_gpx:
+        for act, (gpx1, gpx2) in zip(new_activities, to_merge_gpx):
             merged_gpx = self.merge_gpx(gpx1, gpx2)
+            merged_gpx.set_activity(act)
             merged.append(merged_gpx)
         logger.info(f"Merged {len(merged)} activities.")
         return merged
@@ -361,10 +356,12 @@ class StravaMerger:
                     name = tname
                     break
             else:
-                name = f"StravaMerger joint {act1.sport}"
+                name = f"{act1.name} & {act2.name}"
 
+            current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
             act = Activity(
                 name=name,
+                description=f"StravaMerger bot at {current_time}",
                 id=-1,
                 start_date=act1.start_date,
                 start_coords=act1.start_coords,
@@ -373,7 +370,12 @@ class StravaMerger:
             new_activities.append(act)
         return new_activities
 
-    def save_activities(self, to_merge_gpx: list, merged_activities: list, folder: str):
+    def save_activities(
+        self,
+        to_merge_gpx: List[Tuple[CustomGPX, CustomGPX]],
+        merged_activities: List[CustomGPX],
+        folder: str,
+    ):
         """
         Saves the original and merged activities as GPX files in a specified root folder.
         Creates the folder if it does not exist.
@@ -391,12 +393,10 @@ class StravaMerger:
             zip(to_merge_gpx, merged_activities)
         ):
             # Define file paths
-            original_file_1 = os.path.join(folder, f"original_activity_{idx}_first.gpx")
-            original_file_2 = os.path.join(
-                folder, f"original_activity_{idx}_second.gpx"
-            )
-            merged_file = os.path.join(folder, f"merged_activity_{idx}.gpx")
-            merged_gpx.set_filepath(merged_file)
+            original_file_1 = os.path.join(folder, f"{idx}_1_{gpx1.activity.name}.gpx")
+            original_file_2 = os.path.join(folder, f"{idx}_2_{gpx2.activity.name}.gpx")
+            merged_file = os.path.join(folder, f"{idx}_{merged_gpx.activity.name}.gpx")
+            merged_gpx.activity.filepath = merged_file
 
             # Save the original activities
             with open(original_file_1, "w") as file:
@@ -421,10 +421,10 @@ class StravaMerger:
             body += f"<li><a href='{second_link}'>{act2.name} (Start Date: {act2.start_date})</a></li><br>"
         return body
 
-    def get_confirm_mail_body(self, urls: List[str], activities: List[Activity]) -> str:
+    def get_confirm_mail_body(self, merged_gpxs: List[CustomGPX]) -> str:
         body = self.CONFIRM_BODY
-        for act, url in zip(activities, urls):
-            body += f"<li><a href='{url}'>{act.name} (Start Date: {act.start_date})</a></li>"
+        for gpx in merged_gpxs:
+            body += f"<li><a href='{gpx.activity.url}'>{gpx.activity.name} (Start Date: {gpx.activity.start_date})</a></li>"
         return body
 
     def send_email(
@@ -442,7 +442,7 @@ class StravaMerger:
         """
         message = MIMEMultipart()
 
-        message["From"] = self.SENDER_MAIL
+        message["From"] = self.sender_mail
         message["To"] = recipient_email
         message["Subject"] = subject
 
@@ -450,7 +450,7 @@ class StravaMerger:
         # SMTP server setup (example with Gmail)
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
-        server.login(self.SENDER_MAIL, self.mail_password)
+        server.login(self.sender_mail, self.mail_password)
 
         # Sending the email
         server.send_message(message)
@@ -458,12 +458,13 @@ class StravaMerger:
 
         logger.info("Email sent to {}".format(recipient_email))
 
-    def check_upload_status(self, upload_id: int) -> dict:
+    def check_upload_status(self, upload_id: int, idx: int) -> dict:
         """
         Checks the status of an upload on Strava.
 
         Args:
             upload_id (str): The upload ID received from the upload activity response.
+            idx (int): The index of the upload in the list of uploads.
 
         Returns:
             dict: Response from Strava API regarding the upload status.
@@ -474,6 +475,12 @@ class StravaMerger:
                 headers={"Authorization": f"Bearer {self.access_token}"},
             )
             status = response.json()
+            self.check_rate_limit(response)
+
+            logger.info(
+                f"Status {idx}/{self.num_files} with {upload_id}: {status['status']}"
+            )
+
             if status["status"] == "Your activity is ready.":
                 return response
             elif status["status"] == "There was an error processing your activity.":
@@ -481,47 +488,41 @@ class StravaMerger:
             if status["status"] == "Your activity is still being processed.":
                 pass
 
-            time.sleep(3)  # Sleep for a short interval before checking again
+            time.sleep(5)  # Sleep for a short interval before checking again
 
-    def upload_activity_to_strava(
+    def upload_activities_to_strava(
         self,
         filedata: List[CustomGPX],
-        activities: List[Activity],
         data_type: str = "gpx",
-        description: str = "",
-    ) -> List[str]:
+    ) -> List[CustomGPX]:
         """
         Uploads an activity file to Strava.
 
         Args:
             filedata (List[CustomGPX]): List of GPX objects to upload.
-            activities (List[Activity]): List of activities with metadata.
             data_type (str): Type of the activity file ('fit', 'tcx', or 'gpx').
-            description (str): Description of the activity.
 
         Returns:
-            List[str]: List of URLs to the uploaded activities.
+            List[CustomGPX]: List of CustomGPX objects with the URL of the uploaded activity.
         """
-        assert len(filedata) == len(activities), f"{len(filedata)} != {len(activities)}"
+        self.num_files = len(filedata)
         success = [False] * len(filedata)
-
         tries = 0
-        urls = []
         while any(not s for s in success):
             tries += 1
-            for i, (file, act) in enumerate(zip(filedata, activities)):
+            for i, file in enumerate(filedata):
                 if success[i]:
                     continue
-                assert os.path.exists(file.filepath)
-                files = {"file": open(file.filepath, "rb")}
+                assert os.path.exists(file.activity.filepath)
+                files = {"file": open(file.activity.filepath, "rb")}
 
                 data = {
                     "data_type": data_type,
-                    "name": act.name,
-                    "description": description,
+                    "name": file.activity.name,
+                    "description": file.activity.description,
                     "trainer": 0,
                     "commute": 0,
-                    "sport_type": file.sport,
+                    "sport_type": file.activity.sport,
                 }
 
                 response = requests.post(
@@ -530,15 +531,16 @@ class StravaMerger:
                     files=files,
                     data=data,
                 )
+                self.check_rate_limit(response)
                 upload_id = str(response.json()["id"])
-                response = self.check_upload_status(upload_id)
+                response = self.check_upload_status(upload_id, idx=i + 1)
                 status = response.json()["status"]
                 if status == "Your activity is ready.":
                     url = os.path.join(
                         self.ACTIVITIES_WEBURL, str(response.json()["activity_id"])
                     )
                     logger.info(f"Uploaded {i+1}/{len(filedata)} to {url}")
-                    urls.append(url)
+                    file.activity.url = url
                     success[i] = True
                 elif status == "There was an error processing your activity.":
                     pass
@@ -552,11 +554,11 @@ class StravaMerger:
             if all(success):
                 break
 
-            # Wait for 10 minutes before checking again
-            time.sleep(600)
+            # Wait for 5 minutes before checking again
+            time.sleep(300)
             if tries % 10 == 0:
                 logger.info(
                     f"Tried {tries} times, {sum(success)/len(success)} succeeded so far."
                 )
 
-        return urls
+        return filedata

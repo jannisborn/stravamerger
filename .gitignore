@@ -162,3 +162,5 @@ cython_debug/
 *secret.json
 *.DS_Store
 debug.txt
+data/
+stravamerger/
