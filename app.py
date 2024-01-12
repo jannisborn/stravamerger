@@ -13,6 +13,7 @@ import requests
 from gpxpy.gpx import GPXTrack, GPXTrackSegment
 from loguru import logger
 from tqdm import tqdm
+
 from utils import NAME_DICT, Activity, CustomGPX, haversine, parse_date
 
 
@@ -352,7 +353,10 @@ class StravaMerger:
 
         for act1, act2 in acts:
             for loc, tname in NAME_DICT.items():
-                if haversine(loc, act1.start_coords) < self.dist_theta:
+                if (
+                    haversine(loc, act1.start_coords) < self.dist_theta
+                    or haversine(loc, act2.start_coords) < self.dist_theta
+                ):
                     name = tname
                     break
             else:
