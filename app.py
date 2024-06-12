@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import gpxpy.gpx
 import requests
@@ -158,14 +158,15 @@ class StravaMerger:
             if current_chain == []:
                 current_chain.append(activity_object)
                 continue
-
+            logger.debug(activity_object)
             last_activity = current_chain[-1]
             end_latlng = last_activity.end_coords
             start_latlng = activity_object.start_coords
-            if start_latlng is None or end_latlng is None:
+            if start_latlng == [] or end_latlng == []:
                 # Activity without GPS footage
                 current_chain = []
                 continue
+            logger.debug(f"{end_latlng} and {start_latlng}")
             dist = haversine(end_latlng, start_latlng)
             same_day = parse_date(last_activity.start_date) == parse_date(
                 activity_object.start_date
