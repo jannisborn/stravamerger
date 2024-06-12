@@ -146,11 +146,15 @@ class StravaMerger:
         candidate_chains = []  # most will have only one activity
         for i, activity in enumerate(sorted_activities):
 
+            start_datetime = datetime.strptime(
+                activity["start_date_local"], "%Y-%m-%dT%H:%M:%SZ"
+            )
+            end_datetime = start_datetime + timedelta(seconds=activity["elapsed_time"])
             activity_object = Activity(
                 name=activity["name"],
                 id=activity["id"],
                 start_date=activity["start_date_local"],
-                end_date=activity["end_date_local"],
+                end_date=end_datetime.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 start_coords=activity["start_latlng"],
                 end_coords=activity["end_latlng"],
                 sport=activity["type"],
