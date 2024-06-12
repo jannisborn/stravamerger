@@ -155,13 +155,17 @@ class StravaMerger:
                 end_coords=activity["end_latlng"],
                 sport=activity["type"],
             )
-            if not current_chain:
+            if current_chain == []:
                 current_chain.append(activity_object)
                 continue
 
             last_activity = current_chain[-1]
             end_latlng = last_activity.end_coords
             start_latlng = activity_object.start_coords
+            if start_latlng is None or end_latlng is None:
+                # Activity without GPS footage
+                current_chain = []
+                continue
             dist = haversine(end_latlng, start_latlng)
             same_day = parse_date(last_activity.start_date) == parse_date(
                 activity_object.start_date
@@ -195,7 +199,7 @@ class StravaMerger:
             else:
                 raise ValueError("Impossible case")
 
-            return merge_chains
+        return merge_chains
 
     def activity_to_gpx(self, activity: Activity) -> CustomGPX:
         """
