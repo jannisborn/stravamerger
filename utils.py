@@ -35,7 +35,7 @@ def haversine(loc1: list, loc2: list) -> float:
 def parse_date(date_str: str) -> datetime.date:
     """Parse a datetime string to a date object."""
     date_str = date_str.rstrip("Z")
-    return datetime.fromisoformat(date_str).date()
+    return datetime.fromisoformat(date_str)
 
 
 @dataclass

@@ -175,8 +175,9 @@ class StravaMerger:
                     # Activity without GPS footage
                     continue
                 dist = haversine(end_latlng, start_latlng)
-                same_day = parse_date(last_activity.start_date) == parse_date(
-                    activity_object.start_date
+                same_day = (
+                    parse_date(last_activity.start_date).date()
+                    == parse_date(activity_object.start_date).date()
                 )
                 same_type = last_activity.sport == activity_object.sport
 
