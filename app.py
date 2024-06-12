@@ -186,11 +186,12 @@ class StravaMerger:
                         + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
                     )
                     # Append to identified chain
+                    match = True
                     candidate_chain.append(activity_object)
                     break
                 elif not same_type:
-                    # Create new chain
-                    candidate_chains.append([activity_object])
+                    # Try next chain
+                    continue
                 elif not same_day:
                     # If <6h passed between activities we consider them as adjacent
                     stop = datetime.strptime(
@@ -200,14 +201,17 @@ class StravaMerger:
                         activity_object.start_date, "%Y-%m-%dT%H:%M:%SZ"
                     )
                     if abs(stop - start) < timedelta(hours=6):
+                        match = True
                         candidate_chain.append(activity_object)
-                    else:
-                        candidate_chains.append([activity_object])
+                        break
                 elif dist >= self.dist_theta:
-                    # Break activity cycle
-                    candidate_chains.append([activity_object])
+                    continue
                 else:
                     raise ValueError("Impossible case")
+
+            if not match:
+                # Create new chain
+                candidate_chains.append([activity_object])
 
         merge_chains = [c for c in candidate_chains if len(c) > 1]
         return merge_chains
