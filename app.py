@@ -157,6 +157,7 @@ class StravaMerger:
             )
             if not current_chain:
                 current_chain.append(activity_object)
+                continue
 
             last_activity = current_chain[-1]
             end_latlng = last_activity.end_coords
@@ -170,7 +171,7 @@ class StravaMerger:
             if same_day and same_type and dist < self.dist_theta:
                 logger.info(
                     f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
-                    + f"Activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
+                    + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
                 )
                 current_chain.append(activity_object)
             elif not same_type:
