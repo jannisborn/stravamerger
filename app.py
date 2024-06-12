@@ -195,7 +195,7 @@ class StravaMerger:
                     start = datetime.strptime(
                         activity_object.start_date, "%Y-%m-%dT%H:%M:%SZ"
                     )
-                    if abs(datetime1 - datetime2) < timedelta(hours=6)
+                    if abs(stop - start) < timedelta(hours=6):
                         candidate_chain.append(activity_object)
                     else:
                         candidate_chains.append([activity_object])
