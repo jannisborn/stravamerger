@@ -43,6 +43,7 @@ class Activity:
     name: str
     id: int
     start_date: str
+    end_date: str
     start_coords: Tuple[float, float]
     end_coords: Tuple[float, float]
     filepath: Optional[str] = None

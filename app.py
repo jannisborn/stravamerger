@@ -143,63 +143,69 @@ class StravaMerger:
             activities, key=lambda x: parse_date(x["start_date_local"])
         )
 
-        merge_chains = []
-        current_chain = []
+        candidate_chains = []  # most will have only one activity
         for i, activity in enumerate(sorted_activities):
 
             activity_object = Activity(
                 name=activity["name"],
                 id=activity["id"],
                 start_date=activity["start_date_local"],
+                end_date=activity["end_date_local"],
                 start_coords=activity["start_latlng"],
                 end_coords=activity["end_latlng"],
                 sport=activity["type"],
             )
-            if current_chain == []:
-                current_chain.append(activity_object)
+            # For first activity
+            if i == 0:
+                candidate_chains.append([activity_object])
                 continue
+
             logger.debug(activity_object)
-            last_activity = current_chain[-1]
-            end_latlng = last_activity.end_coords
-            start_latlng = activity_object.start_coords
-            if start_latlng == [] or end_latlng == []:
-                # Activity without GPS footage
-                current_chain = []
-                continue
-            logger.debug(f"{end_latlng} and {start_latlng}")
-            dist = haversine(end_latlng, start_latlng)
-            same_day = parse_date(last_activity.start_date) == parse_date(
-                activity_object.start_date
-            )
-            same_type = last_activity.sport == activity_object.sport
+            match = False
+            for candidate_chain in candidate_chains:
 
-            if same_day and same_type and dist < self.dist_theta:
-                logger.info(
-                    f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
-                    + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
+                last_activity = candidate_chain[-1]
+                end_latlng = last_activity.end_coords
+                start_latlng = activity_object.start_coords
+                if start_latlng == [] or end_latlng == []:
+                    # Activity without GPS footage
+                    continue
+                dist = haversine(end_latlng, start_latlng)
+                same_day = parse_date(last_activity.start_date) == parse_date(
+                    activity_object.start_date
                 )
-                current_chain.append(activity_object)
-            elif not same_type:
-                # To allow interleaved activities.
-                # NOTE: This means we cannot have two concurrent chains
-                continue
-            elif not same_day:
-                # If <6h passed between activities we consider them as adjacent
-                if True:
-                    # TODO: DETERMINE 6H distance
-                    pass
-                else:
-                    if len(current_chain) > 1:
-                        merge_chains.append(current_chain)
-                    current_chain = [activity_object]
-            elif dist >= self.dist_theta:
-                # Break activity cycle
-                if len(current_chain) > 1:
-                    merge_chains.append(current_chain)
-                current_chain = [activity_object]
-            else:
-                raise ValueError("Impossible case")
+                same_type = last_activity.sport == activity_object.sport
 
+                if same_day and same_type and dist < self.dist_theta:
+                    logger.info(
+                        f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
+                        + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
+                    )
+                    # Append to identified chain
+                    candidate_chain.append(activity_object)
+                    break
+                elif not same_type:
+                    # Create new chain
+                    candidate_chains.append([activity_object])
+                elif not same_day:
+                    # If <6h passed between activities we consider them as adjacent
+                    stop = datetime.strptime(
+                        last_activity.end_date, "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                    start = datetime.strptime(
+                        activity_object.start_date, "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                    if abs(datetime1 - datetime2) < timedelta(hours=6)
+                        candidate_chain.append(activity_object)
+                    else:
+                        candidate_chains.append([activity_object])
+                elif dist >= self.dist_theta:
+                    # Break activity cycle
+                    candidate_chains.append([activity_object])
+                else:
+                    raise ValueError("Impossible case")
+
+        merge_chains = [c for c in candidate_chains if len(c) > 1]
         return merge_chains
 
     def activity_to_gpx(self, activity: Activity) -> CustomGPX:
