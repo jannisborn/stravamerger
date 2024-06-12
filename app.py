@@ -152,26 +152,27 @@ class StravaMerger:
                 id=activity["id"],
                 start_date=activity["start_date_local"],
                 start_coords=activity["start_latlng"],
+                end_coords=activity["end_latlng"],
                 sport=activity["type"],
             )
             if not current_chain:
                 current_chain.append(activity_object)
 
             last_activity = current_chain[-1]
-            end_latlng = last_activity.get("end_latlng")
-            start_latlng = activity.get("start_latlng")
+            end_latlng = last_activity.end_coords
+            start_latlng = activity_object.start_coords
             dist = haversine(end_latlng, start_latlng)
-            same_day = parse_date(last_activity["start_date_local"]) == parse_date(
-                activity["start_date_local"]
+            same_day = parse_date(last_activity.start_date) == parse_date(
+                activity_object.start_date
             )
-            same_type = last_activity.get("type") == activity.get("type")
+            same_type = last_activity.sport == activity_object.sport
 
             if same_day and same_type and dist < self.dist_theta:
                 logger.info(
                     f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
-                    + f"Activity {last_activity['name']} on {last_activity['start_date_local']} with {last_activity['id']}"
+                    + f"Activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
                 )
-                current_chain.append(activity)
+                current_chain.append(activity_object)
             elif not same_type:
                 # To allow interleaved activities.
                 # NOTE: This means we cannot have two concurrent chains
@@ -184,12 +185,12 @@ class StravaMerger:
                 else:
                     if len(current_chain) > 1:
                         merge_chains.append(current_chain)
-                    current_chain = [activity]
+                    current_chain = [activity_object]
             elif dist >= self.dist_theta:
                 # Break activity cycle
                 if len(current_chain) > 1:
                     merge_chains.append(current_chain)
-                current_chain = [activity]
+                current_chain = [activity_object]
             else:
                 raise ValueError("Impossible case")
 
