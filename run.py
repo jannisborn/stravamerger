@@ -46,7 +46,7 @@ def run(
         logger.info("No activities to merge.")
         return
     to_merge_gpxs = [merger.fetch_gpxs(chain) for chain in merge_chains]
-    new_activities = [merger.get_new_activities(chain) for chain in to_merge_gpxs]
+    new_activities = [merger.get_new_activity(chain) for chain in to_merge_gpxs]
     merged = merger(to_merge_gpxs, new_activities=new_activities)
     merger.save_activities(to_merge_gpxs, merged, folder=output_folder)
 

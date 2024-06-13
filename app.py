@@ -134,6 +134,12 @@ class StravaMerger:
                 page += 1
         return activities
 
+    @staticmethod
+    def get_end_date(start_date: str, duration: str):
+        start_date = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
+        end_date = start_date + timedelta(seconds=duration)
+        return end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def detect_merging_activities(
         self, activities: List[Dict[str, Any]]
     ) -> List[List[Activity]]:
@@ -146,15 +152,15 @@ class StravaMerger:
         candidate_chains = []  # most will have only one activity
         for i, activity in enumerate(sorted_activities):
 
-            start_datetime = datetime.strptime(
-                activity["start_date_local"], "%Y-%m-%dT%H:%M:%SZ"
+            end_date = self.get_end_date(
+                activity["start_date_local"], activity["elapsed_time"]
             )
-            end_datetime = start_datetime + timedelta(seconds=activity["elapsed_time"])
+
             activity_object = Activity(
                 name=activity["name"],
                 id=activity["id"],
                 start_date=activity["start_date_local"],
-                end_date=end_datetime.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                end_date=end_date,
                 start_coords=activity["start_latlng"],
                 end_coords=activity["end_latlng"],
                 sport=activity["type"],
@@ -371,32 +377,32 @@ class StravaMerger:
         logger.info(f"Merged {len(merged)} activities.")
         return merged
 
-    def get_new_activities(self, acts: List[CustomGPX]) -> List[Activity]:
+    def get_new_activity(self, acts: List[CustomGPX]) -> Activity:
         """Returns a list of new activities to be uploaded to Strava."""
-        new_activities = []
-
-        for act1, act2 in acts:
+        name = ""
+        for act in acts:
             for loc, tname in NAME_DICT.items():
-                if (
-                    haversine(loc, act1.start_coords) < self.dist_theta
-                    or haversine(loc, act2.start_coords) < self.dist_theta
-                ):
-                    name = tname
+                if haversine(loc, act.start_coords) < self.dist_theta:
+                    name = tname + "&"
                     break
             else:
-                name = f"{act1.name} & {act2.name}"
+                name = f" {act.name} &"
+        name = name[:-1]
 
-            current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-            act = Activity(
-                name=name,
-                description=f"StravaMerger bot at {current_time}",
-                id=-1,
-                start_date=act1.start_date,
-                start_coords=act1.start_coords,
-                sport=act1.sport,
-            )
-            new_activities.append(act)
-        return new_activities
+        current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        act = Activity(
+            name=name,
+            description=f"StravaMerger bot at {current_time}",
+            id=-1,
+            start_date=acts[0].start_date,
+            end_date=self.get_end_date(
+                acts[-1]["start_date_local"], acts[-1]["elapsed_time"]
+            ),
+            start_coords=acts[0].start_coords,
+            end_coords=acts[-1].end_coords,
+            sport=acts[0].sport,
+        )
+        return act
 
     def save_activities(
         self,
