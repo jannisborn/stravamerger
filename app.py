@@ -425,7 +425,7 @@ class StravaMerger:
         for idx, (old_gpxs, new_gpx) in enumerate(zip(to_merge_gpx, merged_activities)):
             # Define file paths
             org_paths = [
-                os.path.join(folder, f"{idx}_{i}_{old_gpxs.activity.name}.gpx")
+                os.path.join(folder, f"{idx}_{i}_{old_gpxs[i].activity.name}.gpx")
                 for i in range(len(old_gpxs))
             ]
             merged_path = os.path.join(folder, f"{idx}_{new_gpx.activity.name}.gpx")
