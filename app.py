@@ -450,6 +450,7 @@ class StravaMerger:
             for act in activity_chain:
                 link = f"https://www.strava.com/activities/{act.id}"
                 body += f"<li><a href='{link}'>{act.name} (Start Date: {act.start_date})</a></li>"
+            body += "\n"
         return body
 
     def get_confirm_mail_body(self, merged_gpxs: List[CustomGPX]) -> str:
