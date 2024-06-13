@@ -396,9 +396,7 @@ class StravaMerger:
             description=f"StravaMerger bot at {current_time}",
             id=-1,
             start_date=first_activity.start_date,
-            end_date=self.get_end_date(
-                last_activity["start_date_local"], last_activity["elapsed_time"]
-            ),
+            end_date=last_activity.end_date,
             start_coords=first_activity.start_coords,
             end_coords=last_activity.end_coords,
             sport=first_activity.sport,
