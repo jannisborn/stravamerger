@@ -318,8 +318,7 @@ class StravaMerger:
                     f"Processing activity {i+1}/{len(acts_to_merge)}: {act.id}"
                 )
                 pbar.update(1)
-                gpx = self.activity_to_gpx(act)
-                gpxs.append(gpx)
+                gpxs.append(self.activity_to_gpx(act))
 
         return gpxs
 
@@ -377,10 +376,11 @@ class StravaMerger:
         logger.info(f"Merged {len(merged)} activities.")
         return merged
 
-    def get_new_activity(self, acts: List[CustomGPX]) -> Activity:
+    def get_new_activity(self, gpx_list: List[CustomGPX]) -> Activity:
         """Returns a list of new activities to be uploaded to Strava."""
         name = ""
-        for act in acts:
+        for gpx in gpx_list:
+            act = gpx.activity
             for loc, tname in NAME_DICT.items():
                 if haversine(loc, act.start_coords) < self.dist_theta:
                     name = tname + "&"
@@ -388,19 +388,20 @@ class StravaMerger:
             else:
                 name = f" {act.name} &"
         name = name[:-1]
+        first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
 
         current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
         act = Activity(
             name=name,
             description=f"StravaMerger bot at {current_time}",
             id=-1,
-            start_date=acts[0].start_date,
+            start_date=first_activity.start_date,
             end_date=self.get_end_date(
-                acts[-1]["start_date_local"], acts[-1]["elapsed_time"]
+                last_activity["start_date_local"], last_activity["elapsed_time"]
             ),
-            start_coords=acts[0].start_coords,
-            end_coords=acts[-1].end_coords,
-            sport=acts[0].sport,
+            start_coords=first_activity.start_coords,
+            end_coords=last_activity.end_coords,
+            sport=first_activity.sport,
         )
         return act
 
