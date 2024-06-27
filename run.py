@@ -1,6 +1,7 @@
 import typer
-from app import StravaMerger
 from loguru import logger
+
+from app import StravaMerger
 
 app = typer.Typer()
 
@@ -22,8 +23,8 @@ def run(
         "-s",
         help="Email address that sends the emails.",
     ),
-    activities: int = typer.Option(
-        ..., "--activities", "-a", help="Number of recent activities to retrieve."
+    n_activities: int = typer.Option(
+        ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
     ),
     output_folder: str = typer.Option(
         ..., "--ofolder", "-o", help="Folder path to save output files."
@@ -36,20 +37,20 @@ def run(
     merger.refresh_access_token()
 
     # Fetch activities
-    old_activities = merger.get_activities(activities)
-    logger.info(f"Fetched {len(old_activities)} activities.")
+    activities = merger.get_activities(n_activities)
+    logger.info(f"Fetched {len(activities)} activities.")
 
-    acts_to_merge = merger.detect_merging_activities(old_activities)
+    merge_chains = merger.detect_merging_activities(activities)
 
-    if len(acts_to_merge) == 0:
+    if len(merge_chains) == 0:
         logger.info("No activities to merge.")
         return
-    to_merge_gpx = merger.fetch_gpxs(acts_to_merge)
-    new_activities = merger.get_new_activities(acts_to_merge)
-    merged = merger(to_merge_gpx, new_activities=new_activities)
-    merger.save_activities(to_merge_gpx, merged, folder=output_folder)
+    to_merge_gpxs = [merger.fetch_gpxs(chain) for chain in merge_chains]
+    new_activities = [merger.get_new_activity(chain) for chain in to_merge_gpxs]
+    merged = merger(to_merge_gpxs, new_activities=new_activities)
+    merger.save_activities(to_merge_gpxs, merged, folder=output_folder)
 
-    delete_body = merger.get_delete_mail_body(acts_to_merge)
+    delete_body = merger.get_delete_mail_body(merge_chains)
     merger.send_email(
         recipient, subject="StravaMerger - Delete activities", body=delete_body
     )
@@ -58,7 +59,7 @@ def run(
     merger.send_email(recipient, subject="StravaMerger - New Activities", body=body)
 
     logger.info(
-        f"Processed {len(new_activities)} activities, Saved {len(to_merge_gpx) + len(merged)} to {output_folder}"
+        f"Processed {len(new_activities)} activities, Saved {len(to_merge_gpxs) + len(merged)} to {output_folder}"
         f" as backup. \nMerged {len(merged)} and uploaded them to Strava "
     )
 

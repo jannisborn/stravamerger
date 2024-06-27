@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import gpxpy.gpx
 import requests
@@ -29,7 +29,13 @@ class StravaMerger:
         """<html><head></head><body><p>Here are the new Strava activities:</p><ul>"""
     )
 
-    def __init__(self, secret_path: str, sender_mail: str, dist_theta: float = 1000.0):
+    def __init__(
+        self,
+        secret_path: str,
+        sender_mail: str,
+        dist_theta: float = 1000.0,
+        hour_theta: int = 6,
+    ):
         """
         Initializes the StravaMerger with the necessary credentials.
 
@@ -37,9 +43,11 @@ class StravaMerger:
             secret_path: Path to the JSON file containing the credentials.
             sender_mail: Email address of the sender.
             dist_theta: Distance threshold for merging activities.
+            hour_theta: Maximal pausing between adjacent activities occuring on ADJACENT days.
         """
 
         self.dist_theta = dist_theta
+        self.hour_theta = hour_theta
         self.sender_mail = sender_mail
 
         with open("secret.json", "r") as f:
@@ -126,55 +134,94 @@ class StravaMerger:
                 page += 1
         return activities
 
+    @staticmethod
+    def get_end_date(start_date: str, duration: str):
+        start_date = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
+        end_date = start_date + timedelta(seconds=duration)
+        return end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def detect_merging_activities(
         self, activities: List[Dict[str, Any]]
-    ) -> List[Tuple[Activity, Activity]]:
+    ) -> List[List[Activity]]:
         """Find and print activities that start where another ended on the same day."""
 
         sorted_activities = sorted(
             activities, key=lambda x: parse_date(x["start_date_local"])
         )
-        matches = []
-        for i, activity in enumerate(sorted_activities):
-            for j, other_activity in enumerate(sorted_activities):
-                if i <= j or activity.get("type") != other_activity.get("type"):
-                    continue
-                if parse_date(activity["start_date_local"]) != parse_date(
-                    other_activity["start_date_local"]
-                ):
-                    continue
-                end_latlng = activity.get("end_latlng")
-                start_latlng = other_activity.get("start_latlng")
-                dist = haversine(end_latlng, start_latlng)
-                if dist < self.dist_theta:
-                    logger.info(
-                        f"Match found: \n\tActivity 1: {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
-                        + f"Activity 2: {other_activity['name']} on {other_activity['start_date_local']} with {other_activity['id']}"
-                    )
-                    first = Activity(
-                        name=activity["name"],
-                        id=activity["id"],
-                        start_date=activity["start_date_local"],
-                        start_coords=activity["start_latlng"],
-                        sport=activity["type"],
-                    )
-                    second = Activity(
-                        name=other_activity["name"],
-                        id=other_activity["id"],
-                        start_date=other_activity["start_date_local"],
-                        start_coords=other_activity["start_latlng"],
-                        sport=other_activity["type"],
-                    )
-                    matches.append((first, second))
-                else:
-                    logger.info(
-                        f"No match found between {activity['id']} ({activity['name']}) and {other_activity['id']}"
-                        + f"({other_activity['name']}), distance was {dist}. Links: "
-                        + f"{os.path.join(self.ACTIVITIES_WEBURL, str(activity['id']))} and "
-                        + f"{os.path.join(self.ACTIVITIES_WEBURL, str(other_activity['id']))}"
-                    )
 
-        return matches
+        candidate_chains = []  # most will have only one activity
+        for i, activity in enumerate(sorted_activities):
+
+            end_date = self.get_end_date(
+                activity["start_date_local"], activity["elapsed_time"]
+            )
+
+            activity_object = Activity(
+                name=activity["name"],
+                id=activity["id"],
+                start_date=activity["start_date_local"],
+                end_date=end_date,
+                start_coords=activity["start_latlng"],
+                end_coords=activity["end_latlng"],
+                sport=activity["type"],
+            )
+            # For first activity
+            if i == 0:
+                candidate_chains.append([activity_object])
+                continue
+
+            logger.debug(activity_object)
+            match = False
+            for candidate_chain in candidate_chains:
+
+                last_activity = candidate_chain[-1]
+                end_latlng = last_activity.end_coords
+                start_latlng = activity_object.start_coords
+                if start_latlng == [] or end_latlng == []:
+                    # Activity without GPS footage
+                    continue
+                dist = haversine(end_latlng, start_latlng)
+                same_day = (
+                    parse_date(last_activity.start_date).date()
+                    == parse_date(activity_object.start_date).date()
+                )
+                same_type = last_activity.sport == activity_object.sport
+
+                if same_day and same_type and dist < self.dist_theta:
+                    logger.info(
+                        f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
+                        + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
+                    )
+                    # Append to identified chain
+                    match = True
+                    candidate_chain.append(activity_object)
+                    break
+                elif not same_type:
+                    # Try next chain
+                    continue
+                elif not same_day:
+                    # If <6h passed between activities we consider them as adjacent
+                    stop = datetime.strptime(
+                        last_activity.end_date, "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                    start = datetime.strptime(
+                        activity_object.start_date, "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                    if abs(stop - start) < timedelta(hours=6):
+                        match = True
+                        candidate_chain.append(activity_object)
+                        break
+                elif dist >= self.dist_theta:
+                    continue
+                else:
+                    raise ValueError("Impossible case")
+
+            if not match:
+                # Create new chain
+                candidate_chains.append([activity_object])
+
+        merge_chains = [c for c in candidate_chains if len(c) > 1]
+        return merge_chains
 
     def activity_to_gpx(self, activity: Activity) -> CustomGPX:
         """
@@ -254,72 +301,48 @@ class StravaMerger:
 
         return gpx
 
-    def fetch_gpxs(
-        self, acts_to_merge: List[Tuple[Activity, Activity]]
-    ) -> List[Tuple[CustomGPX, CustomGPX]]:
+    def fetch_gpxs(self, acts_to_merge: List[Activity]) -> List[CustomGPX]:
         """Fetches and returns GPX data for pairs of activities to be merged.
 
         Args:
             acts_to_merge: List of tuples of activities to be merged.
 
         Returns:
-           List[Tuple[CustomGPX, CustomGPX]] : List of tuples of GPX objects to be merged.
+           List[CustomGPX] : List of GPX objects to be merged.
 
         """
         gpxs = []
         with tqdm(total=len(acts_to_merge), desc="Fetching GPX Data") as pbar:
-            for i, (a1, a2) in enumerate(acts_to_merge):
+            for i, act in enumerate(acts_to_merge):
                 pbar.set_postfix_str(
-                    f"Processing activity pair {i+1}/{len(acts_to_merge)}: {a1.id} and {a2.id}"
+                    f"Processing activity {i+1}/{len(acts_to_merge)}: {act.id}"
                 )
                 pbar.update(1)
-                gpx1, gpx2 = self.activity_to_gpx(a1), self.activity_to_gpx(a2)
-                gpxs.append((gpx1, gpx2))
+                gpxs.append(self.activity_to_gpx(act))
 
         return gpxs
 
-    def merge_gpx(self, gpx1: CustomGPX, gpx2: CustomGPX) -> CustomGPX:
+    def merge_gpx(self, gpx_list: List[CustomGPX]) -> CustomGPX:
         """
         Merges two GPX objects into one in the order of their starting times.
 
         Args:
-            gpx1 (CustomGPX): The first GPX object.
-            gpx2 (CustomGPX): The second GPX object.
+            gpx_list: A list of all CustomGPX objects to be merged.
 
         Returns:
             CustomGPX: The merged GPX object in chronological order.
         """
-        # Find the starting times of each GPX track
-        start_time1 = (
-            gpx1.tracks[0].segments[0].points[0].time
-            if gpx1.tracks and gpx1.tracks[0].segments
-            else None
-        )
-        start_time2 = (
-            gpx2.tracks[0].segments[0].points[0].time
-            if gpx2.tracks and gpx2.tracks[0].segments
-            else None
-        )
-
-        # Determine the order based on start times
-        first_gpx, second_gpx = (
-            (gpx1, gpx2) if start_time1 < start_time2 else (gpx2, gpx1)
-        )
-
         # Merge in chronological order
         merged_gpx = CustomGPX()
         merged_track = GPXTrack()
         merged_segment = GPXTrackSegment()
 
-        # Function to add points from a track to the merged segment
-        def add_points_from_track(gpx):
+        sorted_gpx_list = sorted(gpx_list, key=self.get_start_time)
+
+        for gpx in sorted_gpx_list:
             for track in gpx.tracks:
                 for segment in track.segments:
                     merged_segment.points.extend(segment.points)
-
-        # Add points from both GPX objects
-        add_points_from_track(gpx1)
-        add_points_from_track(gpx2)
 
         # Add the merged segment to the merged track, and the track to the GPX
         merged_track.segments.append(merged_segment)
@@ -327,9 +350,17 @@ class StravaMerger:
 
         return merged_gpx
 
+    @staticmethod
+    def get_start_time(gpx: CustomGPX):
+        return (
+            gpx.tracks[0].segments[0].points[0].time
+            if gpx.tracks and gpx.tracks[0].segments
+            else None
+        )
+
     def __call__(
         self,
-        to_merge_gpx: List[Tuple[CustomGPX, CustomGPX]],
+        to_merge_gpx: List[List[CustomGPX]],
         new_activities: List[Activity],
     ) -> List[CustomGPX]:
         """Merges pairs of activities into one activity."""
@@ -338,45 +369,43 @@ class StravaMerger:
         ), f"{len(to_merge_gpx)} != {len(new_activities)}"
 
         merged = []
-        for act, (gpx1, gpx2) in zip(new_activities, to_merge_gpx):
-            merged_gpx = self.merge_gpx(gpx1, gpx2)
+        for i, (act, gpx_chain) in enumerate(zip(new_activities, to_merge_gpx)):
+            merged_gpx = self.merge_gpx(gpx_chain)
             merged_gpx.set_activity(act)
             merged.append(merged_gpx)
         logger.info(f"Merged {len(merged)} activities.")
         return merged
 
-    def get_new_activities(
-        self, acts: List[Tuple[Activity, Activity]]
-    ) -> List[Activity]:
+    def get_new_activity(self, gpx_list: List[CustomGPX]) -> Activity:
         """Returns a list of new activities to be uploaded to Strava."""
-        new_activities = []
-
-        for act1, act2 in acts:
+        name = ""
+        for gpx in gpx_list:
+            act = gpx.activity
             for loc, tname in NAME_DICT.items():
-                if (
-                    haversine(loc, act1.start_coords) < self.dist_theta
-                    or haversine(loc, act2.start_coords) < self.dist_theta
-                ):
-                    name = tname
+                if haversine(loc, act.start_coords) < self.dist_theta:
+                    name = tname + "&"
                     break
             else:
-                name = f"{act1.name} & {act2.name}"
+                name = f" {act.name} &"
+        name = name[:-1]
+        first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
 
-            current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-            act = Activity(
-                name=name,
-                description=f"StravaMerger bot at {current_time}",
-                id=-1,
-                start_date=act1.start_date,
-                start_coords=act1.start_coords,
-                sport=act1.sport,
-            )
-            new_activities.append(act)
-        return new_activities
+        current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        act = Activity(
+            name=name,
+            description=f"StravaMerger bot at {current_time}",
+            id=-1,
+            start_date=first_activity.start_date,
+            end_date=last_activity.end_date,
+            start_coords=first_activity.start_coords,
+            end_coords=last_activity.end_coords,
+            sport=first_activity.sport,
+        )
+        return act
 
     def save_activities(
         self,
-        to_merge_gpx: List[Tuple[CustomGPX, CustomGPX]],
+        to_merge_gpx: List[List[CustomGPX]],
         merged_activities: List[CustomGPX],
         folder: str,
     ):
@@ -385,7 +414,7 @@ class StravaMerger:
         Creates the folder if it does not exist.
 
         Args:
-            to_merge_gpx (list): List of tuples containing original GPX objects to be merged.
+            to_merge_gpx (list): List of lists containing original GPX objects to be merged.
             merged_activities (list): List of merged GPX objects.
             folder (str): Path to the root folder where files will be saved.
         """
@@ -393,36 +422,35 @@ class StravaMerger:
         if not os.path.exists(folder):
             os.makedirs(folder)
 
-        for idx, ((gpx1, gpx2), merged_gpx) in enumerate(
-            zip(to_merge_gpx, merged_activities)
-        ):
+        for idx, (old_gpxs, new_gpx) in enumerate(zip(to_merge_gpx, merged_activities)):
             # Define file paths
-            original_file_1 = os.path.join(folder, f"{idx}_1_{gpx1.activity.name}.gpx")
-            original_file_2 = os.path.join(folder, f"{idx}_2_{gpx2.activity.name}.gpx")
-            merged_file = os.path.join(folder, f"{idx}_{merged_gpx.activity.name}.gpx")
-            merged_gpx.activity.filepath = merged_file
+            org_paths = [
+                os.path.join(folder, f"{idx}_{i}_{old_gpxs[i].activity.name}.gpx")
+                for i in range(len(old_gpxs))
+            ]
+            merged_path = os.path.join(folder, f"{idx}_{new_gpx.activity.name}.gpx")
+            new_gpx.activity.filepath = merged_path
 
             # Save the original activities
-            with open(original_file_1, "w") as file:
-                file.write(gpx1.to_xml())
-            with open(original_file_2, "w") as file:
-                file.write(gpx2.to_xml())
+            for org_path, org_gpx in zip(org_paths, old_gpxs):
+                with open(org_path, "w") as file:
+                    file.write(org_gpx.to_xml())
 
             # Save the merged activity
-            with open(merged_file, "w") as file:
-                file.write(merged_gpx.to_xml())
+            with open(merged_path, "w") as file:
+                file.write(new_gpx.to_xml())
 
         logger.info(
             f"Saved {len(to_merge_gpx)*2} original activities & their {len(merged_activities)} merged versions in {folder}"
         )
 
-    def get_delete_mail_body(self, activities: List[Tuple[Activity, Activity]]) -> str:
+    def get_delete_mail_body(self, activity_chains: List[List[Activity]]) -> str:
         body = self.DELETE_BODY
-        for act1, act2 in activities:
-            first_link = f"https://www.strava.com/activities/{act1.id}"
-            second_link = f"https://www.strava.com/activities/{act2.id}"
-            body += f"<li><a href='{first_link}'>{act1.name} (Start Date: {act1.start_date})</a></li>"
-            body += f"<li><a href='{second_link}'>{act2.name} (Start Date: {act2.start_date})</a></li><br>"
+        for activity_chain in activity_chains:
+            for act in activity_chain:
+                link = f"https://www.strava.com/activities/{act.id}"
+                body += f"<li><a href='{link}'>{act.name} (Start Date: {act.start_date})</a></li>"
+            body += "<br>"
         return body
 
     def get_confirm_mail_body(self, merged_gpxs: List[CustomGPX]) -> str:
