@@ -242,13 +242,11 @@ class StravaMerger:
         def get_stream_data(key):
             response = requests.get(stream_url, headers=header, params={"keys": [key]})
             self.check_rate_limit(response)
-            idx = 0 if key in ["latlng", "temp"] else 1
-
             if response.status_code == 200 and key in [
                 e["type"] for e in response.json()
             ]:
-                stream = response.json()[idx]["data"]
-                dtype = response.json()[idx]["type"]
+                stream = response.json()[0]["data"]
+                dtype = response.json()[0]["type"]
                 if key != dtype:
                     for i in response.json():
                         for k, v in i.items():
