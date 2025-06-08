@@ -22,6 +22,7 @@ class StravaMerger:
     ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
     ACTIVITIES_WEBURL = "https://www.strava.com/activities/"
     STREAM_URL_TEMPLATE = "https://www.strava.com/api/v3/activities/{}/streams"
+    SINGLE_ACTIVITY_URL= "https://www.strava.com/api/v3/activities/{}"
     UPLOAD_URL = "https://www.strava.com/api/v3/uploads"
 
     DELETE_BODY = """<html><head></head><body><p>Here are the Strava activities to be deleted:</p><ul>"""
@@ -67,7 +68,7 @@ class StravaMerger:
         Args:
             response (requests.Response): The response from the Strava API.
         """
-        if isinstance(response, dict) and response["message"] == "Rate Limit Exceeded":
+        if isinstance(response, dict) and response.get("message") == "Rate Limit Exceeded":
             raise ValueError("Rate Limit Exceeded")
 
     def get_stream_url(self, activity_id: int) -> str:
@@ -132,6 +133,20 @@ class StravaMerger:
                 if len(response) < min(200, num_activities):
                     break
                 page += 1
+
+        for act in tqdm(activities, desc='Getting descriptions...'):
+            time.sleep(0.2)
+            detailed_resp = requests.get(
+                self.SINGLE_ACTIVITY_URL.format(act["id"]),
+                headers=header,
+            )
+            self.check_rate_limit(detailed_resp.json())
+            detailed_act = detailed_resp.json()
+            # Overwrite the summary‐level dict with the detailed dict
+            old_dict = act.copy()
+            act.clear()
+            act.update(detailed_act)
+
         return activities
 
     @staticmethod
@@ -151,6 +166,9 @@ class StravaMerger:
 
         candidate_chains = []  # most will have only one activity
         for i, activity in enumerate(sorted_activities):
+
+            if 'nomerge' in activity['description'].lower():
+                continue
 
             end_date = self.get_end_date(
                 activity["start_date_local"], activity["elapsed_time"]
