@@ -167,7 +167,9 @@ class StravaMerger:
         candidate_chains = []  # most will have only one activity
         for i, activity in enumerate(sorted_activities):
 
-            if 'nomerge' in activity['description'].lower():
+            description = activity['description'] or ''
+
+            if 'nomerge' in description.lower():
                 continue
 
             end_date = self.get_end_date(
