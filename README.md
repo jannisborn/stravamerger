@@ -63,10 +63,7 @@ Merge split Strava activities and upload the merged activity.
 │    --sender              -s      TEXT     Email address that sends the emails. [default: jannis.born@gmail.com]                                         │
 │ *  --n_activities        -n      INTEGER  Number of recent activities to retrieve. [required]                                                           │
 │ *  --ofolder             -o      TEXT     Folder path to save output files. [required]                                                                  │
-│    --distance            -d      FLOAT    Distance threshold for merging activities. [default: 1000.0]                                                  │
-│    --install-completion                   Install completion for the current shell.                                                                     │
-│    --show-completion                      Show completion for the current shell, to copy it or customize the installation.                              │
-│    --help                                 Show this message and exit.                                                                                   │
+│    --distance            -d      FLOAT    Distance threshold for merging activities. [default: 1000.0]                                                  |
 ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ run  Alias for the default command.                                                                                                                     │
