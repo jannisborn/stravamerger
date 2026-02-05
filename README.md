@@ -51,6 +51,24 @@ If you want to use this tool, feel free to get in touch (open an issue). I wrote
 
 
 ## Documentation
-```console
-uv run stravamerger --help
+
+Run `uv run stravamerger --help` to see:
+
+```sh
+Merge split Strava activities and upload the merged activity.                                                                                             
+                                                                                                                                                           
+╭─ Options ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│    --credentials         -c      TEXT     Path to the JSON file with credentials. [default: secret.json]                                                │
+│ *  --recipient           -r      TEXT     Email address to send to-be-deleted and merged activities to. [required]                                      │
+│    --sender              -s      TEXT     Email address that sends the emails. [default: jannis.born@gmail.com]                                         │
+│ *  --n_activities        -n      INTEGER  Number of recent activities to retrieve. [required]                                                           │
+│ *  --ofolder             -o      TEXT     Folder path to save output files. [required]                                                                  │
+│    --distance            -d      FLOAT    Distance threshold for merging activities. [default: 1000.0]                                                  │
+│    --install-completion                   Install completion for the current shell.                                                                     │
+│    --show-completion                      Show completion for the current shell, to copy it or customize the installation.                              │
+│    --help                                 Show this message and exit.                                                                                   │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Commands ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ run  Alias for the default command.                                                                                                                     │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
