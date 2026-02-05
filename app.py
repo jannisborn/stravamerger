@@ -51,14 +51,28 @@ class StravaMerger:
         self.hour_theta = hour_theta
         self.sender_mail = sender_mail
 
-        with open("secret.json", "r") as f:
-            secret = json.load(f)
+        try:
+            with open(secret_path, "r") as f:
+                secret = json.load(f)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"Credentials file not found at {secret_path!r}."
+            ) from e
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Credentials file at {secret_path!r} is not valid JSON."
+            ) from e
 
-        self.client_id = secret["client_id"]
-        self.client_secret = secret["client_secret"]
-        self.access_token = secret["access_token"]
-        self.refresh_token = secret["refresh_token"]
-        self.mail_password = secret["mail"]
+        try:
+            self.client_id = secret["client_id"]
+            self.client_secret = secret["client_secret"]
+            self.access_token = secret["access_token"]
+            self.refresh_token = secret["refresh_token"]
+            self.mail_password = secret["mail"]
+        except KeyError as e:
+            raise KeyError(
+                f"Missing required key {e.args[0]!r} in credentials file {secret_path!r}."
+            ) from e
 
     @staticmethod
     def check_rate_limit(response: requests.Response):

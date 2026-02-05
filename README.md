@@ -20,16 +20,14 @@ For example, if you record a ride to work in the morning and a ride back home in
 
 #### Installation
 ```console
-python -m venv stravamerger
-source stravamerger/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
-Good to go :rocket:
+This creates a local `.venv/` and installs dependencies.
 
 #### Example
 
 ```console
-python run.py -credentials secret.json -activities 21 --distance 500 -ofolder data/ -recipient name@host.domain 
+uv run stravamerger --credentials secret.json --n_activities 21 --distance 500 --ofolder data/ --recipient name@host.domain
 ```
 See documentation below.
 
@@ -54,26 +52,5 @@ If you want to use this tool, feel free to get in touch (open an issue). I wrote
 
 ## Documentation
 ```console
-python run.py --help
-Usage: run.py [OPTIONS]
-
-Options:
-  -c, --credentials TEXT          Path to the JSON file with credentials.
-                                  [required]
-  -r, --recipient TEXT            Email address to send to-be-deleted and
-                                  merged activities to.  [required]
-  -s, --sender TEXT               Email address that sends the emails.
-                                  [default: jannis.born@gmail.com]
-  -a, --activities INTEGER        Number of recent activities to retrieve.
-                                  [required]
-  -o, --ofolder TEXT              Folder path to save output files.
-                                  [required]
-  -d, --distance FLOAT            Distance threshold for merging activities.
-                                  [default: 1000.0]
-  --install-completion [bash|zsh|fish|powershell|pwsh]
-                                  Install completion for the specified shell.
-  --show-completion [bash|zsh|fish|powershell|pwsh]
-                                  Show completion for the specified shell, to
-                                  copy it or customize the installation.
-  --help                          Show this message and exit.
+uv run stravamerger --help
 ```

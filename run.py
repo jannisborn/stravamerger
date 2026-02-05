@@ -3,36 +3,18 @@ from loguru import logger
 
 from app import StravaMerger
 
-app = typer.Typer()
+app = typer.Typer(no_args_is_help=True)
 
 
-@app.command()
 def run(
-    credential_path: str = typer.Option(
-        ..., "--credentials", "-c", help="Path to the JSON file with credentials."
-    ),
-    recipient: str = typer.Option(
-        ...,
-        "--recipient",
-        "-r",
-        help="Email address to send to-be-deleted and merged activities to.",
-    ),
-    sender: str = typer.Option(
-        "jannis.born@gmail.com",
-        "--sender",
-        "-s",
-        help="Email address that sends the emails.",
-    ),
-    n_activities: int = typer.Option(
-        ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
-    ),
-    output_folder: str = typer.Option(
-        ..., "--ofolder", "-o", help="Folder path to save output files."
-    ),
-    distance: float = typer.Option(
-        1000.0, "--distance", "-d", help="Distance threshold for merging activities."
-    ),
-):
+    *,
+    credential_path: str,
+    recipient: str,
+    sender: str,
+    n_activities: int,
+    output_folder: str,
+    distance: float,
+) -> None:
     merger = StravaMerger(credential_path, sender_mail=sender, dist_theta=distance)
     merger.refresh_access_token()
 
@@ -64,5 +46,94 @@ def run(
     )
 
 
-if __name__ == "__main__":
+@app.callback(invoke_without_command=True)
+def merge(
+    ctx: typer.Context,
+    credential_path: str = typer.Option(
+        "secret.json",
+        "--credentials",
+        "-c",
+        help="Path to the JSON file with credentials.",
+    ),
+    recipient: str = typer.Option(
+        ...,
+        "--recipient",
+        "-r",
+        help="Email address to send to-be-deleted and merged activities to.",
+    ),
+    sender: str = typer.Option(
+        "jannis.born@gmail.com",
+        "--sender",
+        "-s",
+        help="Email address that sends the emails.",
+    ),
+    n_activities: int = typer.Option(
+        ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
+    ),
+    output_folder: str = typer.Option(
+        ..., "--ofolder", "-o", help="Folder path to save output files."
+    ),
+    distance: float = typer.Option(
+        1000.0, "--distance", "-d", help="Distance threshold for merging activities."
+    ),
+):
+    """Merge split Strava activities and upload the merged activity."""
+    if ctx.invoked_subcommand is not None:
+        return
+    run(
+        credential_path=credential_path,
+        recipient=recipient,
+        sender=sender,
+        n_activities=n_activities,
+        output_folder=output_folder,
+        distance=distance,
+    )
+
+
+@app.command(name="run")
+def run_cmd(
+    credential_path: str = typer.Option(
+        "secret.json",
+        "--credentials",
+        "-c",
+        help="Path to the JSON file with credentials.",
+    ),
+    recipient: str = typer.Option(
+        ...,
+        "--recipient",
+        "-r",
+        help="Email address to send to-be-deleted and merged activities to.",
+    ),
+    sender: str = typer.Option(
+        "jannis.born@gmail.com",
+        "--sender",
+        "-s",
+        help="Email address that sends the emails.",
+    ),
+    n_activities: int = typer.Option(
+        ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
+    ),
+    output_folder: str = typer.Option(
+        ..., "--ofolder", "-o", help="Folder path to save output files."
+    ),
+    distance: float = typer.Option(
+        1000.0, "--distance", "-d", help="Distance threshold for merging activities."
+    ),
+):
+    """Alias for the default command."""
+    run(
+        credential_path=credential_path,
+        recipient=recipient,
+        sender=sender,
+        n_activities=n_activities,
+        output_folder=output_folder,
+        distance=distance,
+    )
+
+
+def cli():
     app()
+
+
+if __name__ == "__main__":
+    cli()
