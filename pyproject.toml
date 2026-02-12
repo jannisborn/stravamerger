@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stravamerger"
+version = "0.1.0"
+description = "Merge multiple Strava activities into one and re-upload."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Jannis Born" }]
+dependencies = [
+  "gpxpy",
+  "loguru",
+  "requests",
+  "tqdm",
+  "typer",
+]
+
+[project.scripts]
+stravamerger = "run:cli"
+
+[tool.setuptools]
+py-modules = ["app", "run", "utils"]
