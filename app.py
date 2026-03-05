@@ -36,6 +36,7 @@ class StravaMerger:
         sender_mail: str,
         dist_theta: float = 1000.0,
         hour_theta: int = 6,
+        require_same_gear: bool = False,
     ):
         """
         Initializes the StravaMerger with the necessary credentials.
@@ -45,10 +46,12 @@ class StravaMerger:
             sender_mail: Email address of the sender.
             dist_theta: Distance threshold for merging activities.
             hour_theta: Maximal pausing between adjacent activities occuring on ADJACENT days.
+            require_same_gear: If True, only merge activities with identical non-empty gear_id.
         """
 
         self.dist_theta = dist_theta
         self.hour_theta = hour_theta
+        self.require_same_gear = require_same_gear
         self.sender_mail = sender_mail
 
         try:
@@ -197,6 +200,7 @@ class StravaMerger:
                 end_date=end_date,
                 start_coords=activity["start_latlng"],
                 end_coords=activity["end_latlng"],
+                gear_id=activity.get("gear_id"),
                 sport=activity["type"],
             )
             # For first activity
@@ -220,8 +224,14 @@ class StravaMerger:
                     == parse_date(activity_object.start_date).date()
                 )
                 same_type = last_activity.sport == activity_object.sport
+                same_gear = (
+                    bool(last_activity.gear_id)
+                    and bool(activity_object.gear_id)
+                    and last_activity.gear_id == activity_object.gear_id
+                )
+                gear_matches = same_gear or not self.require_same_gear
 
-                if same_day and same_type and dist < self.dist_theta:
+                if same_day and same_type and gear_matches and dist < self.dist_theta:
                     logger.info(
                         f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
                         + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
@@ -232,6 +242,8 @@ class StravaMerger:
                     break
                 elif not same_type:
                     # Try next chain
+                    continue
+                elif self.require_same_gear and not same_gear:
                     continue
                 elif not same_day:
                     # If <6h passed between activities we consider them as adjacent
@@ -421,6 +433,13 @@ class StravaMerger:
                 name = f" {act.name} &"
         name = name[:-1]
         first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
+        chain_gear_ids = [gpx.activity.gear_id for gpx in gpx_list]
+        if chain_gear_ids and all(
+            gid and gid == chain_gear_ids[0] for gid in chain_gear_ids
+        ):
+            merged_gear_id = chain_gear_ids[0]
+        else:
+            merged_gear_id = None
 
         current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
         act = Activity(
@@ -431,9 +450,28 @@ class StravaMerger:
             end_date=last_activity.end_date,
             start_coords=first_activity.start_coords,
             end_coords=last_activity.end_coords,
+            gear_id=merged_gear_id,
             sport=first_activity.sport,
         )
         return act
+
+    def update_activity_gear(self, activity_id: int, gear_id: str):
+        response = requests.put(
+            self.SINGLE_ACTIVITY_URL.format(activity_id),
+            headers={"Authorization": f"Bearer {self.access_token}"},
+            data={"gear_id": gear_id},
+        )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        self.check_rate_limit(payload)
+        if response.status_code >= 300:
+            logger.warning(
+                f"Could not set gear_id {gear_id} for activity {activity_id}: {response.text}"
+            )
+        else:
+            logger.info(f"Set gear_id {gear_id} for activity {activity_id}")
 
     def save_activities(
         self,
@@ -601,11 +639,14 @@ class StravaMerger:
                 response = self.check_upload_status(upload_id, idx=i + 1)
                 status = response.json()["status"]
                 if status == "Your activity is ready.":
+                    activity_id = response.json()["activity_id"]
                     url = os.path.join(
-                        self.ACTIVITIES_WEBURL, str(response.json()["activity_id"])
+                        self.ACTIVITIES_WEBURL, str(activity_id)
                     )
                     logger.info(f"Uploaded {i+1}/{len(filedata)} to {url}")
                     file.activity.url = url
+                    if file.activity.gear_id:
+                        self.update_activity_gear(activity_id, file.activity.gear_id)
                     success[i] = True
                 elif status == "There was an error processing your activity.":
                     pass

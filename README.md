@@ -12,6 +12,7 @@ MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.or
 Recording devices (Garmin, Strava app etc) do not support to interleave the recording of one activity with another.
 For example, if you record a ride to work in the morning and a ride back home in the evening but decide to go for a run over lunch, you end with 3 activities. This tool will:
 - run over your last `--activities` Strava activities (including private ones) and check for two activities starting on the same day, with the same activity type and with the startpoint of the later activity within `--distance` of the endpoint of the earlier one
+- optionally enforce identical gear across matched activities with `--require-same-gear` (bike / running shoes via Strava `gear_id`)
 - for each match, it will concatenate the two activities, preserve all data (elevation, heartrate, temperature etc.) and upload the new activities automatically to your profile
 - you then get a confirmation email with links to the new activities
 - Unfortunately, Strava does not allow activities to be **deleted** via the API. You will therefore receive a second email with links for activities to-be-deleted. Delete those ones and you're good to go!
@@ -28,6 +29,12 @@ This creates a local `.venv/` and installs dependencies.
 
 ```console
 uv run stravamerger --credentials secret.json --n_activities 21 --distance 500 --ofolder data/ --recipient name@host.domain
+```
+
+To only merge activities that used the same gear (disabled by default):
+
+```console
+uv run stravamerger --credentials secret.json --n_activities 21 --distance 500 --ofolder data/ --recipient name@host.domain --require-same-gear
 ```
 See documentation below.
 
@@ -55,17 +62,32 @@ If you want to use this tool, feel free to get in touch (open an issue). I wrote
 Run `uv run stravamerger --help` to see:
 
 ```sh
-Merge split Strava activities and upload the merged activity.                                                                                             
-                                                                                                                                                           
-╭─ Options ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│    --credentials         -c      TEXT     Path to the JSON file with credentials. [default: secret.json]                                                │
-│ *  --recipient           -r      TEXT     Email address to send to-be-deleted and merged activities to. [required]                                      │
-│    --sender              -s      TEXT     Email address that sends the emails. [default: jannis.born@gmail.com]                                         │
-│ *  --n_activities        -n      INTEGER  Number of recent activities to retrieve. [required]                                                           │
-│ *  --ofolder             -o      TEXT     Folder path to save output files. [required]                                                                  │
-│    --distance            -d      FLOAT    Distance threshold for merging activities. [default: 1000.0]                                                  |
-╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-╭─ Commands ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ run  Alias for the default command.                                                                                                                     │
-╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Merge split Strava activities and upload the merged activity.
+
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│    --credentials         -c      TEXT     Path to the JSON file with         │
+│                                           credentials.                       │
+│                                           [default: secret.json]             │
+│ *  --recipient           -r      TEXT     Email address to send              │
+│                                           to-be-deleted and merged           │
+│                                           activities to.                     │
+│                                           [required]                         │
+│    --sender              -s      TEXT     Email address that sends the       │
+│                                           emails.                            │
+│                                           [default: jannis.born@gmail.com]   │
+│ *  --n_activities        -n      INTEGER  Number of recent activities to     │
+│                                           retrieve.                          │
+│                                           [required]                         │
+│ *  --ofolder             -o      TEXT     Folder path to save output files.  │
+│                                           [required]                         │
+│    --distance            -d      FLOAT    Distance threshold for merging     │
+│                                           activities.                        │
+│                                           [default: 1000.0]                  │
+│    --require-same-gear                    Only merge activities when all     │
+│                                           matched activities use the same    │
+│                                           gear_id.                           │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Commands ───────────────────────────────────────────────────────────────────╮
+│ run  Alias for the default command.                                          │
+╰──────────────────────────────────────────────────────────────────────────────╯
 ```

@@ -46,6 +46,7 @@ class Activity:
     end_date: str
     start_coords: Tuple[float, float]
     end_coords: Tuple[float, float]
+    gear_id: Optional[str] = None
     filepath: Optional[str] = None
     sport: Optional[str] = None
     description: str = ""
