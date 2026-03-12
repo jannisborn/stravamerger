@@ -14,8 +14,14 @@ def run(
     n_activities: int,
     output_folder: str,
     distance: float,
+    require_same_gear: bool,
 ) -> None:
-    merger = StravaMerger(credential_path, sender_mail=sender, dist_theta=distance)
+    merger = StravaMerger(
+        credential_path,
+        sender_mail=sender,
+        dist_theta=distance,
+        require_same_gear=require_same_gear,
+    )
     merger.refresh_access_token()
 
     # Fetch activities
@@ -76,6 +82,11 @@ def merge(
     distance: float = typer.Option(
         1000.0, "--distance", "-d", help="Distance threshold for merging activities."
     ),
+    require_same_gear: bool = typer.Option(
+        False,
+        "--require-same-gear",
+        help="Only merge activities when all matched activities use the same gear_id.",
+    ),
 ):
     """Merge split Strava activities and upload the merged activity."""
     if ctx.invoked_subcommand is not None:
@@ -87,6 +98,7 @@ def merge(
         n_activities=n_activities,
         output_folder=output_folder,
         distance=distance,
+        require_same_gear=require_same_gear,
     )
 
 
@@ -119,6 +131,11 @@ def run_cmd(
     distance: float = typer.Option(
         1000.0, "--distance", "-d", help="Distance threshold for merging activities."
     ),
+    require_same_gear: bool = typer.Option(
+        False,
+        "--require-same-gear",
+        help="Only merge activities when all matched activities use the same gear_id.",
+    ),
 ):
     """Alias for the default command."""
     run(
@@ -128,6 +145,7 @@ def run_cmd(
         n_activities=n_activities,
         output_folder=output_folder,
         distance=distance,
+        require_same_gear=require_same_gear,
     )
 
 
