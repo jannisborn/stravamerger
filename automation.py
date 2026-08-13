@@ -90,14 +90,23 @@ class JobStore:
         kind: str,
         source_activities: list[Activity],
         replacement: CustomGPX,
+        hole_distances_meters: dict[int, list[float]] | None = None,
     ) -> dict[str, Any]:
         replacement_data = asdict(replacement.activity)
         replacement_data["filepath"] = os.path.abspath(replacement.activity.filepath)
+        hole_distances_meters = hole_distances_meters or {}
         job = {
             "id": job_id,
             "kind": kind,
             "source_ids": [source.id for source in source_activities],
             "sources": [asdict(source) for source in source_activities],
+            "hole_distances_meters": {
+                str(source.id): [
+                    float(distance)
+                    for distance in hole_distances_meters.get(source.id, [])
+                ]
+                for source in source_activities
+            },
             "replacement": replacement_data,
             "status": "ready",
             "delete_notified": False,
@@ -157,21 +166,28 @@ def run_automation(
             gpx_cache[activity.id] = merger.activity_to_gpx(activity)
         return gpx_cache[activity.id]
 
-    def repair(gpx: CustomGPX) -> tuple[CustomGPX | None, int]:
+    def repair(gpx: CustomGPX) -> tuple[CustomGPX | None, list[float]]:
         nonlocal google_client
         activity = gpx.activity
         if not fix_holes or "nofix" in activity.description.lower():
-            return gpx, 0
+            return gpx, []
         if store.review_reason(activity.id):
-            return None, 0
+            return None, []
         holes = detect_holes(
             gpx,
             time_threshold=hole_time_threshold,
             distance_threshold=hole_distance_threshold,
         )
+        for hole in holes:
+            logger.info(
+                'Detected GPS hole in "{}" (activity {}): {} straight-line gap.',
+                activity.name,
+                activity.id,
+                _format_distance(hole.distance_meters),
+            )
         if not holes:
             store.mark_checked_clean(activity.id)
-            return gpx, 0
+            return gpx, []
         if len(holes) > MAX_HOLES_PER_ACTIVITY:
             message = (
                 f"Activity {activity.id} ({activity.name}) has {len(holes)} holes, "
@@ -179,7 +195,7 @@ def run_automation(
             )
             summary.review_messages.append(message)
             store.mark_for_review(activity.id, message)
-            return None, 0
+            return None, []
 
         mode = travel_mode_for_sport(activity.sport)
         if mode is None:
@@ -189,13 +205,13 @@ def run_automation(
             )
             summary.review_messages.append(message)
             store.mark_for_review(activity.id, message)
-            return None, 0
+            return None, []
         if not merger.google_maps_api_key:
             summary.review_messages.append(
                 f"Activity {activity.id} ({activity.name}) has {len(holes)} hole(s), "
                 "but no Google Maps API key is configured."
             )
-            return None, 0
+            return None, []
         google_client = google_client or GoogleRoutesClient(merger.google_maps_api_key)
 
         repairs = []
@@ -216,8 +232,8 @@ def run_automation(
             )
             summary.review_messages.append(message)
             store.mark_for_review(activity.id, message)
-            return None, 0
-        return repair_holes(gpx, repairs), len(repairs)
+            return None, []
+        return repair_holes(gpx, repairs), [hole.distance_meters for hole in holes]
 
     new_job_ids = []
     for chain in merge_chains:
@@ -230,13 +246,15 @@ def run_automation(
         original_gpxs = [fetch(activity) for activity in chain]
         replacement_inputs = []
         repaired_count = 0
+        hole_distances_meters = {}
         for original in original_gpxs:
-            repaired, count = repair(original)
+            repaired, distances = repair(original)
             if repaired is None:
                 replacement_inputs = []
                 break
             replacement_inputs.append(repaired)
-            repaired_count += count
+            hole_distances_meters[original.activity.id] = distances
+            repaired_count += len(distances)
         if not replacement_inputs:
             continue
 
@@ -255,6 +273,7 @@ def run_automation(
             kind="merge",
             source_activities=chain,
             replacement=replacement,
+            hole_distances_meters=hole_distances_meters,
         )
         new_job_ids.append(job_id)
         summary.merged_jobs += 1
@@ -270,12 +289,12 @@ def run_automation(
             continue
         source = merger.activity_from_api(api_activity)
         original = fetch(source)
-        repaired, repaired_count = repair(original)
-        if repaired is None or repaired_count == 0:
+        repaired, hole_distances_meters = repair(original)
+        if repaired is None or not hole_distances_meters:
             continue
 
         replacement = repaired
-        replacement.activity = _fixed_activity(source, repaired_count)
+        replacement.activity = _fixed_activity(source, len(hole_distances_meters))
         job_id = f"fix-{source.id}"
         merger.save_replacement(
             [original],
@@ -288,10 +307,11 @@ def run_automation(
             kind="fix",
             source_activities=[source],
             replacement=replacement,
+            hole_distances_meters={source.id: hole_distances_meters},
         )
         new_job_ids.append(job_id)
         summary.repaired_jobs += 1
-        summary.repaired_holes += repaired_count
+        summary.repaired_holes += len(hole_distances_meters)
 
     if new_job_ids:
         _notify_deletions(merger, store, recipient, new_job_ids)
@@ -500,9 +520,19 @@ def _delete_mail_body(jobs: list[dict[str, Any]]) -> str:
                 continue
             seen.add(source["id"])
             url = f"https://www.strava.com/activities/{source['id']}"
+            distances_by_source = job.get("hole_distances_meters", {})
+            distances = distances_by_source.get(str(source["id"]), [])
+            if distances:
+                label = "GPS hole" if len(distances) == 1 else "GPS holes"
+                distance_text = ", ".join(
+                    _format_distance(distance) for distance in distances
+                )
+                details = f"{label}: {distance_text} straight-line"
+            else:
+                details = "no GPS hole; merge replacement"
             body.append(
                 f"<li><a href='{url}'>{escape(source['name'])}</a> "
-                f"({escape(job['kind'])})</li>"
+                f"({escape(details)})</li>"
             )
     body.append("</ul></body></html>")
     return "".join(body)
@@ -526,3 +556,9 @@ def _review_mail_body(messages: list[str]) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _format_distance(distance_meters: float) -> str:
+    if distance_meters >= 1_000:
+        return f"{distance_meters / 1_000:.2f} km"
+    return f"{distance_meters:.0f} m"

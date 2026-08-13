@@ -8,7 +8,13 @@ from unittest.mock import patch
 import gpxpy.gpx
 
 from app import GPXTPX_NAMESPACE, StravaMerger, UploadResult
-from automation import JobStore, _fixed_activity, _load_replacement, run_automation
+from automation import (
+    JobStore,
+    _delete_mail_body,
+    _fixed_activity,
+    _load_replacement,
+    run_automation,
+)
 from gpxfixer import Route
 from utils import Activity, CustomGPX
 
@@ -48,6 +54,7 @@ class AutomationStateTests(unittest.TestCase):
             kind="fix",
             source_activities=[source],
             replacement=gpx,
+            hole_distances_meters={123: [1_500.25]},
         )
 
         loaded_store = JobStore(state_path)
@@ -57,6 +64,9 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(loaded_gpx.activity.external_id, "stravamerger-fix-123-v1")
         with open(state_path) as file:
             self.assertEqual(json.load(file)["version"], 1)
+        email_body = _delete_mail_body([loaded_store.jobs["fix-123"]])
+        self.assertIn("Ride", email_body)
+        self.assertIn("1.50 km", email_body)
 
     def test_completed_jobs_no_longer_claim_sources(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")

@@ -57,7 +57,8 @@ duplicate. StravaMerger therefore uses this workflow:
 
 1. Save source GPX backups and the replacement GPX in `--ofolder`.
 2. Record a durable job in `<ofolder>/.stravamerger-state.json`.
-3. Email links to the source activities that must be deleted, when email is enabled.
+3. Email links to the source activities that must be deleted, including detected GPS
+   hole distances, when email is enabled.
 4. Attempt the replacement upload.
 5. If Strava reports a duplicate, wait for source deletion and retry the saved file on
    a later run.
