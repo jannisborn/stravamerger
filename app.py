@@ -319,7 +319,7 @@ class StravaMerger:
                 candidate_chains.append([activity_object])
                 continue
 
-            logger.debug(activity_object)
+            logger.debug('Considering activity "{}"', activity_object.name)
             match = False
             for candidate_chain in candidate_chains:
 
@@ -408,9 +408,7 @@ class StravaMerger:
         def stream_data(key: str) -> list | None:
             stream = streams.get(key)
             if stream is None:
-                logger.warning(
-                    f"Could not fetch {key} stream for activity {activity.id}"
-                )
+                logger.warning(f'Could not fetch {key} stream for "{activity.name}"')
                 return None
             return stream.get("data") if isinstance(stream, dict) else None
 
@@ -699,7 +697,7 @@ class StravaMerger:
         recipient_email: str,
         subject: str,
         body: str,
-    ):
+    ) -> bool:
         """Sends an email with a list of Strava activities to be deleted.
 
         Args:
@@ -709,7 +707,7 @@ class StravaMerger:
         """
         if not self.sender_mail:
             logger.info(f"Email disabled; skipped notification: {subject}")
-            return
+            return False
         if not recipient_email:
             raise ValueError("Email is enabled but no recipient was configured.")
         if not self.mail_password:
@@ -734,6 +732,7 @@ class StravaMerger:
         server.quit()
 
         logger.info(f"Email sent to {recipient_email}")
+        return True
 
     def check_upload_status(
         self, upload_id: int, idx: int, *, max_polls: int = 60
@@ -903,5 +902,11 @@ class StravaMerger:
     def duplicate_activity_id(error: str | None) -> int | None:
         if not error:
             return None
-        match = re.search(r"duplicate of activity\s+(\d+)", error, re.IGNORECASE)
+        if "duplicate" not in error.lower():
+            return None
+        match = re.search(
+            r"(?:activity\s+|/activities/)(\d+)",
+            error,
+            re.IGNORECASE,
+        )
         return int(match.group(1)) if match else None

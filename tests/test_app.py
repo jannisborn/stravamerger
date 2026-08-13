@@ -143,6 +143,17 @@ class StravaApiTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.activity_id, 987654)
 
+    def test_duplicate_activity_id_accepts_strava_html_link(self):
+        error = (
+            "replacement.gpx duplicate of "
+            "<a href='/activities/19729897492'>Fahrt am Morgen</a>"
+        )
+
+        self.assertEqual(
+            StravaMerger.duplicate_activity_id(error),
+            19729897492,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

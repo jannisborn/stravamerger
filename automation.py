@@ -110,6 +110,7 @@ class JobStore:
             "replacement": replacement_data,
             "status": "ready",
             "delete_notified": False,
+            "delete_notification_recipient": None,
             "created_at": _now(),
             "updated_at": _now(),
             "last_error": None,
@@ -143,7 +144,7 @@ def run_automation(
     output_folder: str,
     recipient: str,
     state_path: str,
-    fix_holes: bool = True,
+    fix_holes: bool = False,
     hole_time_threshold: float = 5.0,
     hole_distance_threshold: float = 400.0,
 ) -> AutomationSummary:
@@ -180,9 +181,8 @@ def run_automation(
         )
         for hole in holes:
             logger.info(
-                'Detected GPS hole in "{}" (activity {}): {} straight-line gap.',
+                'Detected GPS hole in "{}": {} straight-line gap.',
                 activity.name,
-                activity.id,
                 _format_distance(hole.distance_meters),
             )
         if not holes:
@@ -279,7 +279,7 @@ def run_automation(
         summary.merged_jobs += 1
         summary.repaired_holes += repaired_count
 
-    for api_activity in available:
+    for api_activity in available if fix_holes else []:
         if (
             api_activity["id"] in merged_source_ids
             or not merger.can_fix_activity(api_activity)
@@ -334,6 +334,7 @@ def _resume_jobs(
     summary: AutomationSummary,
 ) -> None:
     ready = []
+    deletion_pending = []
     for job_id, job in store.jobs.items():
         if job["status"] == "uploaded":
             if not any(
@@ -342,20 +343,32 @@ def _resume_jobs(
                 job["status"] = "complete"
                 job["updated_at"] = _now()
             continue
+        if job["status"] == "ready":
+            duplicate_id = StravaMerger.duplicate_activity_id(job.get("last_error"))
+            if duplicate_id in job["source_ids"]:
+                job["status"] = "awaiting_deletion"
+                job["updated_at"] = _now()
         if job["status"] == "awaiting_deletion":
             if any(
                 merger.activity_exists(source_id) for source_id in job["source_ids"]
             ):
+                deletion_pending.append(job_id)
                 summary.deferred_jobs += 1
                 continue
             job["status"] = "ready"
             job["updated_at"] = _now()
         if job["status"] == "ready":
             ready.append(job_id)
+            if any(
+                merger.activity_exists(source_id) for source_id in job["source_ids"]
+            ):
+                deletion_pending.append(job_id)
     store.save()
 
     pending_notifications = [
-        job_id for job_id in ready if not store.jobs[job_id]["delete_notified"]
+        job_id
+        for job_id in deletion_pending
+        if store.jobs[job_id].get("delete_notification_recipient") != recipient
     ]
     if pending_notifications:
         _notify_deletions(merger, store, recipient, pending_notifications)
@@ -370,13 +383,19 @@ def _notify_deletions(
     job_ids: list[str],
 ) -> None:
     jobs = [store.jobs[job_id] for job_id in job_ids]
-    merger.send_email(
+    backfilled = [_backfill_hole_distances(job) for job in jobs]
+    if any(backfilled):
+        store.save()
+    delivered = merger.send_email(
         recipient,
         subject="StravaMerger - Delete source activities",
         body=_delete_mail_body(jobs),
     )
+    if not delivered:
+        return
     for job in jobs:
         job["delete_notified"] = True
+        job["delete_notification_recipient"] = recipient
         job["updated_at"] = _now()
     store.save()
 
@@ -447,16 +466,10 @@ def _fixed_activity(source: Activity, repaired_holes: int) -> Activity:
 def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     filepath = job["replacement"]["filepath"]
     xml = _repair_legacy_extension_file(filepath)
-    replacement_name = os.path.basename(filepath)
-    if replacement_name.endswith("_replacement.gpx"):
-        prefix = replacement_name.removesuffix("_replacement.gpx")
-        for source_id in job["source_ids"]:
-            source_path = os.path.join(
-                os.path.dirname(filepath),
-                f"{prefix}_source_{source_id}.gpx",
-            )
-            if os.path.isfile(source_path):
-                _repair_legacy_extension_file(source_path)
+    for source_id in job["source_ids"]:
+        source_path = _source_backup_path(job, source_id)
+        if source_path and os.path.isfile(source_path):
+            _repair_legacy_extension_file(source_path)
     parsed = gpxpy.parse(xml)
     gpx = CustomGPX()
     gpx.creator = parsed.creator
@@ -467,6 +480,37 @@ def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     gpx.waypoints = parsed.waypoints
     gpx.set_activity(Activity(**job["replacement"]))
     return gpx
+
+
+def _backfill_hole_distances(job: dict[str, Any]) -> bool:
+    """Populate hole distances for jobs created before they were persisted."""
+    if "hole_distances_meters" in job:
+        return False
+    distances_by_source = {}
+    for source in job["sources"]:
+        source_path = _source_backup_path(job, source["id"])
+        if not source_path or not os.path.isfile(source_path):
+            distances_by_source[str(source["id"])] = []
+            continue
+        xml = _repair_legacy_extension_file(source_path)
+        source_gpx = gpxpy.parse(xml)
+        distances_by_source[str(source["id"])] = [
+            hole.distance_meters for hole in detect_holes(source_gpx)
+        ]
+    job["hole_distances_meters"] = distances_by_source
+    return True
+
+
+def _source_backup_path(job: dict[str, Any], source_id: int) -> str | None:
+    replacement_path = job["replacement"]["filepath"]
+    replacement_name = os.path.basename(replacement_path)
+    if not replacement_name.endswith("_replacement.gpx"):
+        return None
+    prefix = replacement_name.removesuffix("_replacement.gpx")
+    return os.path.join(
+        os.path.dirname(replacement_path),
+        f"{prefix}_source_{source_id}.gpx",
+    )
 
 
 def _repair_legacy_extension_file(filepath: str) -> str:
@@ -528,6 +572,8 @@ def _delete_mail_body(jobs: list[dict[str, Any]]) -> str:
                     _format_distance(distance) for distance in distances
                 )
                 details = f"{label}: {distance_text} straight-line"
+            elif job["kind"] == "fix":
+                details = "GPS hole repair; distance unavailable"
             else:
                 details = "no GPS hole; merge replacement"
             body.append(

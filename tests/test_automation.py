@@ -156,6 +156,7 @@ class AutomationStateTests(unittest.TestCase):
                 self.source_exists = True
                 self.upload_attempts = 0
                 self.emails = []
+                self.email_enabled = False
 
             def detect_merging_activities(self, activities):
                 return []
@@ -189,7 +190,10 @@ class AutomationStateTests(unittest.TestCase):
                 return StravaMerger.save_replacement(self, *args, **kwargs)
 
             def send_email(self, recipient, subject, body):
+                if not self.email_enabled:
+                    return False
                 self.emails.append((recipient, subject, body))
+                return True
 
             def upload_activities_to_strava(self, gpxs):
                 self.upload_attempts += 1
@@ -230,30 +234,86 @@ class AutomationStateTests(unittest.TestCase):
 
         merger = Merger()
         state_path = os.path.join(self.temporary_directory.name, "state.json")
-        with patch("automation.GoogleRoutesClient", Routes):
+        disabled = run_automation(
+            merger,
+            activities=[api_activity],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+        self.assertEqual(disabled.repaired_jobs, 0)
+        self.assertEqual(merger.upload_attempts, 0)
+
+        with (
+            patch("automation.GoogleRoutesClient", Routes),
+            patch("automation.logger.info") as info,
+        ):
             first = run_automation(
                 merger,
                 activities=[api_activity],
                 output_folder=self.temporary_directory.name,
                 recipient="me@example.com",
                 state_path=state_path,
+                fix_holes=True,
             )
 
         self.assertEqual(first.repaired_jobs, 1)
         self.assertEqual(first.deferred_jobs, 1)
+        job = JobStore(state_path).jobs["fix-10"]
+        self.assertEqual(job["status"], "awaiting_deletion")
+        self.assertIsNone(job["delete_notification_recipient"])
+        hole_logs = [
+            call
+            for call in info.call_args_list
+            if call.args and call.args[0].startswith("Detected GPS hole")
+        ]
         self.assertEqual(
-            JobStore(state_path).jobs["fix-10"]["status"], "awaiting_deletion"
+            hole_logs[0].args,
+            (
+                'Detected GPS hole in "{}": {} straight-line gap.',
+                "Broken Ride",
+                "1.35 km",
+            ),
         )
 
-        merger.source_exists = False
-        second = run_automation(
+        legacy_store = JobStore(state_path)
+        legacy_job = legacy_store.jobs["fix-10"]
+        legacy_job["status"] = "ready"
+        legacy_job["last_error"] = (
+            "replacement.gpx duplicate of " "<a href='/activities/10'>Broken Ride</a>"
+        )
+        legacy_job["delete_notified"] = True
+        legacy_job.pop("delete_notification_recipient")
+        legacy_job.pop("hole_distances_meters")
+        legacy_store.save()
+
+        merger.email_enabled = True
+        notified = run_automation(
             merger,
             activities=[],
             output_folder=self.temporary_directory.name,
             recipient="me@example.com",
             state_path=state_path,
         )
-        self.assertEqual(second.uploaded_jobs, 1)
+        self.assertEqual(notified.deferred_jobs, 1)
+        self.assertEqual(merger.upload_attempts, 1)
+        self.assertEqual(len(merger.emails), 1)
+        self.assertEqual(merger.emails[0][1], "StravaMerger - Delete source activities")
+        self.assertIn("1.35 km", merger.emails[0][2])
+        self.assertEqual(
+            JobStore(state_path).jobs["fix-10"]["delete_notification_recipient"],
+            "me@example.com",
+        )
+
+        merger.source_exists = False
+        completed = run_automation(
+            merger,
+            activities=[],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+        self.assertEqual(completed.uploaded_jobs, 1)
         self.assertEqual(JobStore(state_path).jobs["fix-10"]["status"], "uploaded")
         self.assertEqual(merger.upload_attempts, 2)
 

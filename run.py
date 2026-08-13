@@ -93,9 +93,9 @@ def merge(
         help="Only merge activities when all matched activities use the same gear_id.",
     ),
     fix_holes: bool = typer.Option(
-        True,
+        False,
         "--fix-holes/--no-fix-holes",
-        help="Detect and repair GPS holes with Google Maps Routes.",
+        help="Opt in to detecting and repairing GPS holes with Google Maps Routes.",
     ),
     hole_time_threshold: float = typer.Option(
         5.0,
@@ -166,9 +166,9 @@ def run_cmd(
         help="Only merge activities when all matched activities use the same gear_id.",
     ),
     fix_holes: bool = typer.Option(
-        True,
+        False,
         "--fix-holes/--no-fix-holes",
-        help="Detect and repair GPS holes with Google Maps Routes.",
+        help="Opt in to detecting and repairing GPS holes with Google Maps Routes.",
     ),
     hole_time_threshold: float = typer.Option(
         5.0,

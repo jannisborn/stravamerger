@@ -25,7 +25,8 @@ selected when their sport matches and their endpoints are sufficiently close. By
 default, they must start on the same local day; the existing overnight-continuation
 behavior is retained.
 
-Every eligible, unprocessed GPS track is also inspected for adjacent points where:
+When `--fix-holes` is supplied, every eligible, unprocessed GPS track is also
+inspected for adjacent points where:
 
 - the timestamp jump is greater than `--hole-time-threshold` (default: 5 seconds), and
 - the straight-line jump is greater than `--hole-distance-threshold` (default: 400 m).
@@ -115,8 +116,8 @@ Store the key as `google_maps_api_key` in `secret.json`, as shown above.
 
 Google Maps Platform usage is billable and governed by Google's current terms. In
 particular, review the applicable restrictions before storing routed geometry or using
-it outside a Google map. If those terms do not fit the deployment, use
-`--no-fix-holes`; the merge automation continues to work without Google.
+it outside a Google map. Hole filling is disabled by default; use `--fix-holes` to opt
+in after configuring Google. The merge automation continues to work without it.
 Hole endpoint coordinates are sent to Google whenever a route is requested.
 
 ### Email
@@ -137,7 +138,8 @@ uv run stravamerger \
   --distance 500 \
   --ofolder data/ \
   --recipient name@example.com \
-  --sender your-address@gmail.com
+  --sender your-address@gmail.com \
+  --fix-holes
 ```
 
 Only merge activities:
@@ -149,8 +151,7 @@ uv run stravamerger \
   --distance 500 \
   --ofolder data/ \
   --recipient name@example.com \
-  --sender your-address@gmail.com \
-  --no-fix-holes
+  --sender your-address@gmail.com
 ```
 
 Require the same bike or shoes across merge candidates:
@@ -169,7 +170,7 @@ uv run stravamerger \
 Useful repair options:
 
 ```text
---fix-holes / --no-fix-holes
+--fix-holes / --no-fix-holes  (default: no-fix-holes)
 --hole-time-threshold FLOAT
 --hole-distance-threshold FLOAT
 --state PATH
