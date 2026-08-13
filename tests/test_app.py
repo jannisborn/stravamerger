@@ -154,6 +154,42 @@ class StravaApiTests(unittest.TestCase):
             19729897492,
         )
 
+    def test_fixed_activity_name_uses_route_only_for_generic_names(self):
+        activity = Activity(
+            name="Fahrt am Morgen",
+            id=12,
+            start_date="2026-08-13T07:00:00Z",
+            end_date="2026-08-13T08:00:00Z",
+            start_coords=(47.310019, 8.544049),
+            end_coords=(47.4, 8.5),
+            sport="Ride",
+        )
+        self.assertEqual(self.merger.fixed_activity_name(activity), "IBM")
+
+        activity.name = "Custom training name"
+        self.assertEqual(
+            self.merger.fixed_activity_name(activity),
+            "Custom training name",
+        )
+
+        activity.name = "Lauf am Abend"
+        activity.start_coords = (47.4, 8.5)
+        gpx = CustomGPX()
+        track = gpxpy.gpx.GPXTrack()
+        segment = gpxpy.gpx.GPXTrackSegment()
+        segment.points.append(gpxpy.gpx.GPXTrackPoint(47.310019, 8.544049))
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+        self.assertEqual(self.merger.fixed_activity_name(activity, gpx), "IBM")
+
+    def test_nomerge_also_disables_hole_repair(self):
+        activity = {
+            "start_latlng": [47.0, 8.0],
+            "description": "Keep this activity NOMERGE please",
+        }
+
+        self.assertFalse(StravaMerger.can_fix_activity(activity))
+
 
 if __name__ == "__main__":
     unittest.main()

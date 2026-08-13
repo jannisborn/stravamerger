@@ -36,6 +36,10 @@ the surviving endpoints. It inserts the returned geometry into the original time
 window and linearly interpolates elevation. Existing points and their heart-rate and
 temperature extensions are retained.
 
+Repaired activities keep their existing name unless it is a generic `Fahrt am ...` or
+`Lauf am ...` name. Generic names are replaced when the track passes a location in
+`NAME_DICT` (for example, `IBM`); otherwise the generic name is retained.
+
 The automatic travel modes are intentionally conservative:
 
 | Strava sport | Google mode |
@@ -64,6 +68,9 @@ duplicate. StravaMerger therefore uses this workflow:
 5. If Strava reports a duplicate, wait for source deletion and retry the saved file on
    a later run.
 6. Email the new Strava link after a successful upload, when email is enabled.
+
+Deletion and upload-confirmation emails are recorded as delivered only after SMTP
+succeeds. A skipped notification is retried on a later run when email is enabled.
 
 Do not delete the state file while jobs are pending. It prevents repeated repairs,
 merges, emails, and Google routing calls. Activities already checked and found clean
@@ -195,7 +202,7 @@ path between runs so pending uploads can resume.
 
 Add these case-insensitive markers to a Strava activity description:
 
-- `nomerge`: exclude the activity from merge matching;
+- `nomerge`: exclude the activity from both merge matching and GPS-hole repair;
 - `nofix`: exclude the activity from GPS-hole repair.
 
 Activities created by StravaMerger are automatically excluded from both operations.

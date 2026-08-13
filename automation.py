@@ -14,7 +14,7 @@ from typing import Any
 import gpxpy
 from loguru import logger
 
-from app import BOT_MARKER, GPXTPX_NAMESPACE, StravaMerger, UploadResult
+from app import BOT_MARKER, GPXTPX_NAMESPACE, StravaMerger
 from gpxfixer import (
     MAX_HOLE_DISTANCE,
     GoogleRoutesClient,
@@ -111,6 +111,7 @@ class JobStore:
             "status": "ready",
             "delete_notified": False,
             "delete_notification_recipient": None,
+            "confirmation_notification_recipient": None,
             "created_at": _now(),
             "updated_at": _now(),
             "last_error": None,
@@ -170,7 +171,9 @@ def run_automation(
     def repair(gpx: CustomGPX) -> tuple[CustomGPX | None, list[float]]:
         nonlocal google_client
         activity = gpx.activity
-        if not fix_holes or "nofix" in activity.description.lower():
+        if not fix_holes or any(
+            marker in activity.description.lower() for marker in ("nofix", "nomerge")
+        ):
             return gpx, []
         if store.review_reason(activity.id):
             return None, []
@@ -294,7 +297,11 @@ def run_automation(
             continue
 
         replacement = repaired
-        replacement.activity = _fixed_activity(source, len(hole_distances_meters))
+        replacement.activity = _fixed_activity(
+            source,
+            len(hole_distances_meters),
+            name=merger.fixed_activity_name(source, replacement),
+        )
         job_id = f"fix-{source.id}"
         merger.save_replacement(
             [original],
@@ -335,9 +342,12 @@ def _resume_jobs(
 ) -> None:
     ready = []
     deletion_pending = []
+    confirmation_pending = []
     for job_id, job in store.jobs.items():
-        if job["status"] == "uploaded":
-            if not any(
+        if job["status"] in {"uploaded", "complete"}:
+            if job.get("confirmation_notification_recipient") != recipient:
+                confirmation_pending.append(job_id)
+            if job["status"] == "uploaded" and not any(
                 merger.activity_exists(source_id) for source_id in job["source_ids"]
             ):
                 job["status"] = "complete"
@@ -372,6 +382,8 @@ def _resume_jobs(
     ]
     if pending_notifications:
         _notify_deletions(merger, store, recipient, pending_notifications)
+    if confirmation_pending:
+        _notify_confirmations(merger, store, recipient, confirmation_pending)
     if ready:
         _upload_jobs(merger, store, ready, recipient, summary)
 
@@ -408,8 +420,15 @@ def _upload_jobs(
     summary: AutomationSummary,
 ) -> None:
     gpxs = [_load_replacement(store.jobs[job_id]) for job_id in job_ids]
+    for job_id, gpx in zip(job_ids, gpxs):
+        job = store.jobs[job_id]
+        if job["kind"] == "fix":
+            source = Activity(**job["sources"][0])
+            name = merger.fixed_activity_name(source, gpx)
+            gpx.activity.name = name
+            job["replacement"]["name"] = name
     results = merger.upload_activities_to_strava(gpxs)
-    successful = []
+    successful_job_ids = []
     for job_id, result in zip(job_ids, results):
         job = store.jobs[job_id]
         job["updated_at"] = _now()
@@ -419,7 +438,7 @@ def _upload_jobs(
             job["uploaded_activity_id"] = result.activity_id
             job["replacement"]["url"] = result.gpx.activity.url
             job["replacement"]["id"] = result.activity_id
-            successful.append(result)
+            successful_job_ids.append(job_id)
             summary.uploaded_jobs += 1
         elif result.activity_id in job["source_ids"]:
             job["status"] = "awaiting_deletion"
@@ -435,16 +454,43 @@ def _upload_jobs(
             job["status"] = "ready"
             summary.deferred_jobs += 1
     store.save()
-    if successful:
-        merger.send_email(
+    if successful_job_ids:
+        _notify_confirmations(
+            merger,
+            store,
             recipient,
-            subject="StravaMerger - New activities",
-            body=_confirmation_mail_body(successful),
+            successful_job_ids,
         )
 
 
-def _fixed_activity(source: Activity, repaired_holes: int) -> Activity:
+def _notify_confirmations(
+    merger: StravaMerger,
+    store: JobStore,
+    recipient: str,
+    job_ids: list[str],
+) -> None:
+    jobs = [store.jobs[job_id] for job_id in job_ids]
+    delivered = merger.send_email(
+        recipient,
+        subject="StravaMerger - New activities",
+        body=_confirmation_mail_body(jobs),
+    )
+    if not delivered:
+        return
+    for job in jobs:
+        job["confirmation_notification_recipient"] = recipient
+        job["updated_at"] = _now()
+    store.save()
+
+
+def _fixed_activity(
+    source: Activity,
+    repaired_holes: int,
+    *,
+    name: str | None = None,
+) -> Activity:
     activity = copy.deepcopy(source)
+    activity.name = name or source.name
     activity.id = -1
     activity.url = None
     activity.filepath = None
@@ -584,12 +630,12 @@ def _delete_mail_body(jobs: list[dict[str, Any]]) -> str:
     return "".join(body)
 
 
-def _confirmation_mail_body(results: list[UploadResult]) -> str:
+def _confirmation_mail_body(jobs: list[dict[str, Any]]) -> str:
     body = ["<html><body><p>These replacement activities are now on Strava:</p><ul>"]
-    for result in results:
-        activity = result.gpx.activity
+    for job in jobs:
+        activity = job["replacement"]
         body.append(
-            f"<li><a href='{escape(activity.url)}'>{escape(activity.name)}</a></li>"
+            f"<li><a href='{escape(activity['url'])}'>{escape(activity['name'])}</a></li>"
         )
     body.append("</ul></body></html>")
     return "".join(body)

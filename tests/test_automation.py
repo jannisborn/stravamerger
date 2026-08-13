@@ -151,6 +151,7 @@ class AutomationStateTests(unittest.TestCase):
 
         class Merger:
             google_maps_api_key = "maps-key"
+            dist_theta = 1_000.0
 
             def __init__(self):
                 self.source_exists = True
@@ -162,6 +163,7 @@ class AutomationStateTests(unittest.TestCase):
                 return []
 
             can_fix_activity = staticmethod(StravaMerger.can_fix_activity)
+            fixed_activity_name = StravaMerger.fixed_activity_name
 
             def activity_from_api(self, activity):
                 return StravaMerger.activity_from_api(activity)
@@ -314,8 +316,16 @@ class AutomationStateTests(unittest.TestCase):
             state_path=state_path,
         )
         self.assertEqual(completed.uploaded_jobs, 1)
-        self.assertEqual(JobStore(state_path).jobs["fix-10"]["status"], "uploaded")
+        completed_job = JobStore(state_path).jobs["fix-10"]
+        self.assertEqual(completed_job["status"], "uploaded")
+        self.assertEqual(
+            completed_job["confirmation_notification_recipient"],
+            "me@example.com",
+        )
         self.assertEqual(merger.upload_attempts, 2)
+        self.assertEqual(len(merger.emails), 2)
+        self.assertEqual(merger.emails[1][1], "StravaMerger - New activities")
+        self.assertIn("Broken Ride", merger.emails[1][2])
 
 
 if __name__ == "__main__":

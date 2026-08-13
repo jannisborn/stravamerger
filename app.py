@@ -280,8 +280,39 @@ class StravaMerger:
         """Return whether an activity is eligible for automatic hole detection."""
         description = (activity.get("description") or "").lower()
         return bool(activity.get("start_latlng")) and not (
-            "nofix" in description or BOT_MARKER.lower() in description
+            "nofix" in description
+            or "nomerge" in description
+            or BOT_MARKER.lower() in description
         )
+
+    def fixed_activity_name(
+        self,
+        activity: Activity,
+        gpx: CustomGPX | None = None,
+    ) -> str:
+        """Choose the name for a repaired single-activity replacement."""
+        generic_name = activity.name.casefold().startswith(("fahrt am ", "lauf am "))
+        if not generic_name:
+            return activity.name
+
+        def uses_location(location: tuple[float, float]) -> bool:
+            if activity.start_coords and (
+                haversine(location, activity.start_coords) < self.dist_theta
+            ):
+                return True
+            if gpx is None:
+                return False
+            return any(
+                haversine(location, (point.latitude, point.longitude)) < self.dist_theta
+                for track in gpx.tracks
+                for segment in track.segments
+                for point in segment.points
+            )
+
+        for location, route_name in NAME_DICT.items():
+            if uses_location(location):
+                return route_name
+        return activity.name
 
     def activity_exists(self, activity_id: int) -> bool:
         """Check whether an owned activity still exists on Strava."""
