@@ -12,8 +12,9 @@ from html import escape
 from typing import Any
 
 import gpxpy
+from loguru import logger
 
-from app import BOT_MARKER, StravaMerger, UploadResult
+from app import BOT_MARKER, GPXTPX_NAMESPACE, StravaMerger, UploadResult
 from gpxfixer import (
     MAX_HOLE_DISTANCE,
     GoogleRoutesClient,
@@ -425,8 +426,18 @@ def _fixed_activity(source: Activity, repaired_holes: int) -> Activity:
 
 def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     filepath = job["replacement"]["filepath"]
-    with open(filepath, "r") as file:
-        parsed = gpxpy.parse(file)
+    xml = _repair_legacy_extension_file(filepath)
+    replacement_name = os.path.basename(filepath)
+    if replacement_name.endswith("_replacement.gpx"):
+        prefix = replacement_name.removesuffix("_replacement.gpx")
+        for source_id in job["source_ids"]:
+            source_path = os.path.join(
+                os.path.dirname(filepath),
+                f"{prefix}_source_{source_id}.gpx",
+            )
+            if os.path.isfile(source_path):
+                _repair_legacy_extension_file(source_path)
+    parsed = gpxpy.parse(xml)
     gpx = CustomGPX()
     gpx.creator = parsed.creator
     gpx.name = parsed.name
@@ -436,6 +447,42 @@ def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     gpx.waypoints = parsed.waypoints
     gpx.set_activity(Activity(**job["replacement"]))
     return gpx
+
+
+def _repair_legacy_extension_file(filepath: str) -> str:
+    """Repair GPX files written with the legacy gpxtpx namespace bug."""
+    with open(filepath, "r", encoding="utf-8") as file:
+        xml = file.read()
+    legacy_prefix = f"{GPXTPX_NAMESPACE}:"
+    if f"<{legacy_prefix}" not in xml and f"</{legacy_prefix}" not in xml:
+        return xml
+
+    repaired = xml.replace(f"<{legacy_prefix}", "<gpxtpx:")
+    repaired = repaired.replace(f"</{legacy_prefix}", "</gpxtpx:")
+    if "xmlns:gpxtpx=" not in repaired:
+        repaired = repaired.replace(
+            "<gpx ",
+            f'<gpx xmlns:gpxtpx="{GPXTPX_NAMESPACE}" ',
+            1,
+        )
+    gpxpy.parse(repaired)
+
+    directory = os.path.dirname(os.path.abspath(filepath))
+    descriptor, temporary_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=".stravamerger-gpx-",
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            file.write(repaired)
+        os.replace(temporary_path, filepath)
+    except Exception:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+        raise
+    logger.warning("Repaired legacy GPX extension namespaces in {}", filepath)
+    return repaired
 
 
 def _delete_mail_body(jobs: list[dict[str, Any]]) -> str:

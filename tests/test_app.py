@@ -103,6 +103,12 @@ class StravaApiTests(unittest.TestCase):
         self.assertEqual(points[0].time.isoformat(), "2026-08-13T07:00:00+00:00")
         self.assertEqual(points[1].elevation, 410)
         self.assertTrue(points[0].extensions)
+        serialized = gpx.to_xml()
+        self.assertIn("xmlns:gpxtpx=", serialized)
+        gpxpy.parse(serialized)
+
+        merged = self.merger.merge_gpx([gpx])
+        gpxpy.parse(merged.to_xml())
 
     def test_synchronous_duplicate_upload_is_returned_without_retry_loop(self):
         filepath = os.path.join(self.temporary_directory.name, "replacement.gpx")

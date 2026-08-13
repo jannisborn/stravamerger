@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import gpxpy.gpx
 
-from app import StravaMerger, UploadResult
+from app import GPXTPX_NAMESPACE, StravaMerger, UploadResult
 from automation import JobStore, _fixed_activity, _load_replacement, run_automation
 from gpxfixer import Route
 from utils import Activity, CustomGPX
@@ -72,6 +72,56 @@ class AutomationStateTests(unittest.TestCase):
                 file,
             )
         self.assertEqual(JobStore(state_path).claimed_source_ids(), {2})
+
+    def test_load_replacement_repairs_legacy_extension_namespace(self):
+        source = Activity(
+            name="Ride",
+            id=123,
+            start_date="2026-08-13T07:00:00Z",
+            end_date="2026-08-13T08:00:00Z",
+            start_coords=(47.0, 8.0),
+            end_coords=(47.1, 8.1),
+            sport="Ride",
+        )
+        replacement = _fixed_activity(source, 1)
+        filepath = os.path.join(
+            self.temporary_directory.name,
+            "fix-123_replacement.gpx",
+        )
+        malformed = f"""<?xml version="1.0" encoding="UTF-8"?>
+<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1" creator="test">
+  <trk><trkseg><trkpt lat="47.0" lon="8.0"><extensions>
+    <{GPXTPX_NAMESPACE}:TrackPointExtension>
+      <{GPXTPX_NAMESPACE}:hr>120</{GPXTPX_NAMESPACE}:hr>
+    </{GPXTPX_NAMESPACE}:TrackPointExtension>
+  </extensions></trkpt></trkseg></trk>
+</gpx>"""
+        with open(filepath, "w") as file:
+            file.write(malformed)
+        source_filepath = os.path.join(
+            self.temporary_directory.name,
+            "fix-123_source_123.gpx",
+        )
+        with open(source_filepath, "w") as file:
+            file.write(malformed)
+        replacement.filepath = filepath
+        job = {
+            "source_ids": [123],
+            "replacement": replacement.__dict__,
+        }
+
+        loaded = _load_replacement(job)
+
+        self.assertEqual(loaded.activity.source_ids, (123,))
+        with open(filepath) as file:
+            repaired = file.read()
+        self.assertIn("xmlns:gpxtpx=", repaired)
+        self.assertIn("<gpxtpx:hr>120</gpxtpx:hr>", repaired)
+        gpxpy.parse(repaired)
+        with open(source_filepath) as file:
+            repaired_source = file.read()
+        self.assertIn("xmlns:gpxtpx=", repaired_source)
+        gpxpy.parse(repaired_source)
 
     def test_duplicate_repair_resumes_after_source_deletion(self):
         api_activity = {

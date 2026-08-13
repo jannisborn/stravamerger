@@ -437,6 +437,8 @@ class StravaMerger:
         gpx_track.segments.append(gpx_segment)
         start_time = parse_datetime(activity.start_date_utc or activity.start_date)
         gpx.set_activity(activity)
+        if heartrate is not None or atemp is not None:
+            gpx.nsmap["gpxtpx"] = GPXTPX_NAMESPACE
 
         for i, (lat, lon) in enumerate(latlong):
             point = gpxpy.gpx.GPXTrackPoint(
@@ -507,6 +509,8 @@ class StravaMerger:
         sorted_gpx_list = sorted(gpx_list, key=self.get_start_time)
 
         for gpx in sorted_gpx_list:
+            if "gpxtpx" in gpx.nsmap:
+                merged_gpx.nsmap["gpxtpx"] = gpx.nsmap["gpxtpx"]
             for track in gpx.tracks:
                 for segment in track.segments:
                     merged_segment.points.extend(segment.points)
