@@ -1,7 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from math import atan2, cos, radians, sin, sqrt
-from typing import Optional, Tuple
 
 import gpxpy.gpx
 
@@ -38,19 +37,29 @@ def parse_date(date_str: str) -> datetime.date:
     return datetime.fromisoformat(date_str)
 
 
+def parse_datetime(date_str: str) -> datetime:
+    """Parse an ISO 8601 timestamp, including Strava's trailing ``Z`` form."""
+    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+
+
 @dataclass
 class Activity:
     name: str
     id: int
     start_date: str
     end_date: str
-    start_coords: Tuple[float, float]
-    end_coords: Tuple[float, float]
-    gear_id: Optional[str] = None
-    filepath: Optional[str] = None
-    sport: Optional[str] = None
+    start_coords: tuple[float, float]
+    end_coords: tuple[float, float]
+    gear_id: str | None = None
+    filepath: str | None = None
+    sport: str | None = None
     description: str = ""
-    url: Optional[str] = None
+    url: str | None = None
+    start_date_utc: str | None = None
+    commute: bool = False
+    trainer: bool = False
+    external_id: str | None = None
+    source_ids: tuple[int, ...] = field(default_factory=tuple)
 
 
 class CustomGPX(gpxpy.gpx.GPX):

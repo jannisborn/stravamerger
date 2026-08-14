@@ -1,7 +1,10 @@
+import os
+
 import typer
 from loguru import logger
 
 from app import StravaMerger
+from automation import run_automation
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -15,6 +18,10 @@ def run(
     output_folder: str,
     distance: float,
     require_same_gear: bool,
+    fix_holes: bool,
+    hole_time_threshold: float,
+    hole_distance_threshold: float,
+    state_path: str | None,
 ) -> None:
     merger = StravaMerger(
         credential_path,
@@ -28,27 +35,25 @@ def run(
     activities = merger.get_activities(n_activities)
     logger.info(f"Fetched {len(activities)} activities.")
 
-    merge_chains = merger.detect_merging_activities(activities)
-
-    if len(merge_chains) == 0:
-        logger.info("No activities to merge.")
-        return
-    to_merge_gpxs = [merger.fetch_gpxs(chain) for chain in merge_chains]
-    new_activities = [merger.get_new_activity(chain) for chain in to_merge_gpxs]
-    merged = merger(to_merge_gpxs, new_activities=new_activities)
-    merger.save_activities(to_merge_gpxs, merged, folder=output_folder)
-
-    delete_body = merger.get_delete_mail_body(merge_chains)
-    merger.send_email(
-        recipient, subject="StravaMerger - Delete activities", body=delete_body
+    state_path = state_path or os.path.join(output_folder, ".stravamerger-state.json")
+    summary = run_automation(
+        merger,
+        activities=activities,
+        output_folder=output_folder,
+        recipient=recipient,
+        state_path=state_path,
+        fix_holes=fix_holes,
+        hole_time_threshold=hole_time_threshold,
+        hole_distance_threshold=hole_distance_threshold,
     )
-    merged = merger.upload_activities_to_strava(merged)
-    body = merger.get_confirm_mail_body(merged)
-    merger.send_email(recipient, subject="StravaMerger - New Activities", body=body)
-
     logger.info(
-        f"Processed {len(new_activities)} activities, Saved {len(to_merge_gpxs) + len(merged)} to {output_folder}"
-        f" as backup. \nMerged {len(merged)} and uploaded them to Strava "
+        "Finished: {} merge replacement(s), {} repaired activity replacement(s), "
+        "{} repaired hole(s), {} upload(s), {} deferred job(s).",
+        summary.merged_jobs,
+        summary.repaired_jobs,
+        summary.repaired_holes,
+        summary.uploaded_jobs,
+        summary.deferred_jobs,
     )
 
 
@@ -62,16 +67,16 @@ def merge(
         help="Path to the JSON file with credentials.",
     ),
     recipient: str = typer.Option(
-        ...,
+        "",
         "--recipient",
         "-r",
-        help="Email address to send to-be-deleted and merged activities to.",
+        help="Notification recipient; required only when --sender is set.",
     ),
     sender: str = typer.Option(
-        "jannis.born@gmail.com",
+        "",
         "--sender",
         "-s",
-        help="Email address that sends the emails.",
+        help="Gmail sender; omit to disable email notifications.",
     ),
     n_activities: int = typer.Option(
         ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
@@ -87,8 +92,28 @@ def merge(
         "--require-same-gear",
         help="Only merge activities when all matched activities use the same gear_id.",
     ),
+    fix_holes: bool = typer.Option(
+        False,
+        "--fix-holes/--no-fix-holes",
+        help="Opt in to detecting and repairing GPS holes with Google Maps Routes.",
+    ),
+    hole_time_threshold: float = typer.Option(
+        5.0,
+        "--hole-time-threshold",
+        help="Minimum time jump in seconds for a GPS hole.",
+    ),
+    hole_distance_threshold: float = typer.Option(
+        400.0,
+        "--hole-distance-threshold",
+        help="Minimum straight-line distance in meters for a GPS hole.",
+    ),
+    state_path: str | None = typer.Option(
+        None,
+        "--state",
+        help="Persistent job-state JSON (defaults inside --ofolder).",
+    ),
 ):
-    """Merge split Strava activities and upload the merged activity."""
+    """Merge split activities, repair GPS holes, and upload replacements."""
     if ctx.invoked_subcommand is not None:
         return
     run(
@@ -99,6 +124,10 @@ def merge(
         output_folder=output_folder,
         distance=distance,
         require_same_gear=require_same_gear,
+        fix_holes=fix_holes,
+        hole_time_threshold=hole_time_threshold,
+        hole_distance_threshold=hole_distance_threshold,
+        state_path=state_path,
     )
 
 
@@ -111,16 +140,16 @@ def run_cmd(
         help="Path to the JSON file with credentials.",
     ),
     recipient: str = typer.Option(
-        ...,
+        "",
         "--recipient",
         "-r",
-        help="Email address to send to-be-deleted and merged activities to.",
+        help="Notification recipient; required only when --sender is set.",
     ),
     sender: str = typer.Option(
-        "jannis.born@gmail.com",
+        "",
         "--sender",
         "-s",
-        help="Email address that sends the emails.",
+        help="Gmail sender; omit to disable email notifications.",
     ),
     n_activities: int = typer.Option(
         ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
@@ -136,6 +165,26 @@ def run_cmd(
         "--require-same-gear",
         help="Only merge activities when all matched activities use the same gear_id.",
     ),
+    fix_holes: bool = typer.Option(
+        False,
+        "--fix-holes/--no-fix-holes",
+        help="Opt in to detecting and repairing GPS holes with Google Maps Routes.",
+    ),
+    hole_time_threshold: float = typer.Option(
+        5.0,
+        "--hole-time-threshold",
+        help="Minimum time jump in seconds for a GPS hole.",
+    ),
+    hole_distance_threshold: float = typer.Option(
+        400.0,
+        "--hole-distance-threshold",
+        help="Minimum straight-line distance in meters for a GPS hole.",
+    ),
+    state_path: str | None = typer.Option(
+        None,
+        "--state",
+        help="Persistent job-state JSON (defaults inside --ofolder).",
+    ),
 ):
     """Alias for the default command."""
     run(
@@ -146,6 +195,10 @@ def run_cmd(
         output_folder=output_folder,
         distance=distance,
         require_same_gear=require_same_gear,
+        fix_holes=fix_holes,
+        hole_time_threshold=hole_time_threshold,
+        hole_distance_threshold=hole_distance_threshold,
+        state_path=state_path,
     )
 
 
