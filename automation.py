@@ -180,6 +180,15 @@ def run_automation(
         activities_by_id=activities_by_id,
         source_exists_cache=source_exists_cache,
     )
+    # Pending-action email is intentionally sent before the potentially expensive
+    # historical scan, so a later process failure cannot suppress the daily reminder.
+    _notify_outstanding_deletions(
+        merger,
+        store,
+        recipient,
+        activities_by_id=activities_by_id,
+        source_exists_cache=source_exists_cache,
+    )
 
     claimed = store.claimed_source_ids()
     available = [activity for activity in activities if activity["id"] not in claimed]
@@ -188,7 +197,6 @@ def run_automation(
     google_client = None
     geocoding_client = None
     address_cache: dict[tuple[float, float], str] = {}
-    gpx_cache: dict[int, CustomGPX] = {}
     scan_budget_exhausted = False
 
     def defer_remaining_scans() -> None:
@@ -202,9 +210,9 @@ def run_automation(
         scan_budget_exhausted = True
 
     def fetch(activity: Activity) -> CustomGPX:
-        if activity.id not in gpx_cache:
-            gpx_cache[activity.id] = merger.activity_to_gpx(activity)
-        return gpx_cache[activity.id]
+        # GPX streams can be very large. Keeping every checked track cached caused
+        # long initial scans to be killed by the OS for excessive memory use.
+        return merger.activity_to_gpx(activity)
 
     def repair(gpx: CustomGPX) -> tuple[CustomGPX | None, list[dict[str, Any]]]:
         nonlocal geocoding_client, google_client
@@ -430,14 +438,13 @@ def run_automation(
 
     if new_job_ids:
         _upload_jobs(merger, store, new_job_ids, recipient, summary)
-
-    _notify_outstanding_deletions(
-        merger,
-        store,
-        recipient,
-        activities_by_id=activities_by_id,
-        source_exists_cache=source_exists_cache,
-    )
+        _notify_outstanding_deletions(
+            merger,
+            store,
+            recipient,
+            activities_by_id=activities_by_id,
+            source_exists_cache=source_exists_cache,
+        )
 
     if summary.review_messages:
         merger.send_email(

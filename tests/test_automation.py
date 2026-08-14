@@ -1,7 +1,9 @@
+import gc
 import json
 import os
 import tempfile
 import unittest
+import weakref
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -81,6 +83,76 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(address, "47.000000, 8.000000")
         warning.assert_called_once()
 
+    def test_clean_track_streams_are_released_during_large_scan(self):
+        live_gpxs = weakref.WeakSet()
+        max_live_gpxs = 0
+
+        class Merger:
+            google_maps_api_key = None
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+            can_fix_activity = staticmethod(StravaMerger.can_fix_activity)
+
+            @staticmethod
+            def activity_from_api(activity):
+                return StravaMerger.activity_from_api(activity)
+
+            def activity_to_gpx(self, activity):
+                nonlocal max_live_gpxs
+                gc.collect()
+                gpx = CustomGPX()
+                track = gpxpy.gpx.GPXTrack()
+                segment = gpxpy.gpx.GPXTrackSegment()
+                segment.points.append(
+                    gpxpy.gpx.GPXTrackPoint(
+                        47.0,
+                        8.0,
+                        time=datetime(2026, 8, 13, tzinfo=timezone.utc),
+                    )
+                )
+                track.segments.append(segment)
+                gpx.tracks.append(track)
+                gpx.set_activity(activity)
+                live_gpxs.add(gpx)
+                max_live_gpxs = max(max_live_gpxs, len(live_gpxs))
+                return gpx
+
+            @staticmethod
+            def send_email(*args, **kwargs):
+                raise AssertionError("Clean tracks do not require an email")
+
+        activities = [
+            {
+                "id": activity_id,
+                "name": f"Ride {activity_id}",
+                "start_date": "2026-08-13T07:00:00Z",
+                "start_date_local": "2026-08-13T09:00:00Z",
+                "elapsed_time": 60,
+                "start_latlng": [47.0, 8.0],
+                "end_latlng": [47.0, 8.0],
+                "gear_id": None,
+                "sport_type": "Ride",
+                "description": "",
+                "commute": False,
+                "trainer": False,
+            }
+            for activity_id in range(10)
+        ]
+
+        run_automation(
+            Merger(),
+            activities=activities,
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=os.path.join(self.temporary_directory.name, "state.json"),
+            fix_holes=True,
+        )
+
+        self.assertLessEqual(max_live_gpxs, 2)
+
     def test_completed_jobs_no_longer_claim_sources(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")
         with open(state_path, "w") as file:
@@ -153,6 +225,65 @@ class AutomationStateTests(unittest.TestCase):
         job = JobStore(state_path).jobs["fix-10"]
         self.assertEqual(job["status"], "cancelled")
         self.assertEqual(info.call_args.args[1], "Broken Ride")
+
+    def test_pending_reminder_is_sent_before_new_activity_scan(self):
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        with open(state_path, "w") as file:
+            json.dump(
+                {
+                    "version": 1,
+                    "jobs": {
+                        "fix-10": {
+                            "id": "fix-10",
+                            "kind": "fix",
+                            "source_ids": [10],
+                            "sources": [
+                                {
+                                    "id": 10,
+                                    "name": "Broken Ride",
+                                    "description": "",
+                                }
+                            ],
+                            "status": "awaiting_deletion",
+                            "last_error": "duplicate of activity 10",
+                            "hole_details": {"10": []},
+                            "hole_distances_meters": {"10": [500]},
+                        }
+                    },
+                },
+                file,
+            )
+
+        class Merger:
+            google_maps_api_key = None
+
+            def __init__(self):
+                self.emails = []
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                raise RuntimeError("historical scan failed")
+
+            def send_email(self, recipient, subject, body):
+                self.emails.append((recipient, subject, body))
+                return True
+
+        merger = Merger()
+        activity = {"id": 10, "name": "Broken Ride", "description": ""}
+
+        with self.assertRaisesRegex(RuntimeError, "historical scan failed"):
+            run_automation(
+                merger,
+                activities=[activity],
+                output_folder=self.temporary_directory.name,
+                recipient="me@example.com",
+                state_path=state_path,
+            )
+
+        self.assertEqual(len(merger.emails), 1)
+        self.assertEqual(
+            merger.emails[0][1], "StravaMerger - Delete source activities"
+        )
 
     def test_load_replacement_repairs_legacy_extension_namespace(self):
         source = Activity(
