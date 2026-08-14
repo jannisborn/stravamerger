@@ -943,7 +943,14 @@ class StravaMerger:
                 gpx.activity.id = activity_id
                 gpx.activity.url = url
                 if gpx.activity.gear_id:
-                    self.update_activity_gear(activity_id, gpx.activity.gear_id)
+                    try:
+                        self.update_activity_gear(activity_id, gpx.activity.gear_id)
+                    except (requests.RequestException, StravaRateLimitError) as error:
+                        logger.warning(
+                            "Uploaded activity {} but could not set its gear: {}",
+                            activity_id,
+                            error,
+                        )
                 results.append(
                     UploadResult(
                         gpx=gpx,

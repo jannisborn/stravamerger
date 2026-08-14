@@ -580,6 +580,22 @@ def _resume_jobs(
             continue
         if job["status"] == "cancelled":
             continue
+        if job["status"] == "manual_review":
+            if job.get("upload_recovery_checked"):
+                continue
+            duplicate_id = StravaMerger.duplicate_activity_id(job.get("last_error"))
+            if (
+                duplicate_id is None
+                or duplicate_id in job["source_ids"]
+                or not _is_uploaded_replacement(merger, job, duplicate_id)
+            ):
+                job["upload_recovery_checked"] = True
+                continue
+            _mark_job_uploaded(job, duplicate_id)
+            logger.info(
+                'Recovered an already-uploaded replacement for "{}".',
+                job["replacement"]["name"],
+            )
         if job["status"] in {"uploaded", "complete"}:
             if job.get("confirmation_notification_recipient") != recipient:
                 confirmation_pending.append(job_id)
@@ -792,40 +808,98 @@ def _upload_jobs(
             name = merger.fixed_activity_name(source, gpx)
             gpx.activity.name = name
             job["replacement"]["name"] = name
-    results = merger.upload_activities_to_strava(gpxs)
     successful_job_ids = []
-    for job_id, result in zip(job_ids, results):
-        job = store.jobs[job_id]
-        job["updated_at"] = _now()
-        job["last_error"] = result.error
-        if result.success:
-            job["status"] = "uploaded"
-            job["uploaded_activity_id"] = result.activity_id
-            job["replacement"]["url"] = result.gpx.activity.url
-            job["replacement"]["id"] = result.activity_id
-            successful_job_ids.append(job_id)
-            summary.uploaded_jobs += 1
-        elif result.activity_id in job["source_ids"]:
-            job["status"] = "awaiting_deletion"
-            summary.deferred_jobs += 1
-        elif result.activity_id is not None:
-            job["status"] = "manual_review"
-            summary.deferred_jobs += 1
-            summary.review_messages.append(
-                f"Job {job_id} is a duplicate of unexpected activity "
-                f"{result.activity_id}; it will not be retried automatically."
+    try:
+        for job_id, gpx in zip(job_ids, gpxs):
+            results = merger.upload_activities_to_strava([gpx])
+            if not results:
+                raise RuntimeError(
+                    f"Strava returned no upload result for queued job {job_id}."
+                )
+            result = results[0]
+            job = store.jobs[job_id]
+            job["updated_at"] = _now()
+            job["last_error"] = result.error
+            if result.success:
+                _mark_job_uploaded(
+                    job,
+                    result.activity_id,
+                    url=result.gpx.activity.url,
+                )
+                successful_job_ids.append(job_id)
+                summary.uploaded_jobs += 1
+            elif result.activity_id in job["source_ids"]:
+                job["status"] = "awaiting_deletion"
+                summary.deferred_jobs += 1
+            elif result.activity_id is not None:
+                if _is_uploaded_replacement(merger, job, result.activity_id):
+                    _mark_job_uploaded(job, result.activity_id)
+                    successful_job_ids.append(job_id)
+                    summary.uploaded_jobs += 1
+                    logger.info(
+                        'Recovered an already-uploaded replacement for "{}".',
+                        job["replacement"]["name"],
+                    )
+                else:
+                    job["status"] = "manual_review"
+                    job["upload_recovery_checked"] = True
+                    summary.deferred_jobs += 1
+                    summary.review_messages.append(
+                        f"Job {job_id} is a duplicate of unexpected activity "
+                        f"{result.activity_id}; it will not be retried automatically."
+                    )
+            else:
+                job["status"] = "ready"
+                summary.deferred_jobs += 1
+            # Persist every outcome before starting another upload. A later rate-limit
+            # failure must not lose successful Strava activity IDs.
+            store.save()
+    finally:
+        if successful_job_ids:
+            _notify_confirmations(
+                merger,
+                store,
+                recipient,
+                successful_job_ids,
             )
-        else:
-            job["status"] = "ready"
-            summary.deferred_jobs += 1
-    store.save()
-    if successful_job_ids:
-        _notify_confirmations(
-            merger,
-            store,
-            recipient,
-            successful_job_ids,
-        )
+
+
+def _mark_job_uploaded(
+    job: dict[str, Any],
+    activity_id: int,
+    *,
+    url: str | None = None,
+) -> None:
+    job["status"] = "uploaded"
+    job["uploaded_activity_id"] = activity_id
+    job["replacement"]["id"] = activity_id
+    job["replacement"]["url"] = url or (
+        f"https://www.strava.com/activities/{activity_id}"
+    )
+    job["last_error"] = None
+    job["updated_at"] = _now()
+
+
+def _is_uploaded_replacement(
+    merger: StravaMerger,
+    job: dict[str, Any],
+    activity_id: int,
+) -> bool:
+    get_activity = getattr(merger, "get_activity", None)
+    if not callable(get_activity):
+        return False
+    activity = get_activity(activity_id)
+    if not activity:
+        return False
+    expected_external_id = job["replacement"].get("external_id")
+    if expected_external_id and activity.get("external_id") == expected_external_id:
+        return True
+    expected_description = job["replacement"].get("description")
+    return bool(
+        expected_description
+        and BOT_MARKER in expected_description
+        and activity.get("description") == expected_description
+    )
 
 
 def _notify_confirmations(

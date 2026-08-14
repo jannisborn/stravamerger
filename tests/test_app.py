@@ -7,7 +7,7 @@ from unittest.mock import patch
 import gpxpy.gpx
 import requests
 
-from app import StravaMerger
+from app import StravaMerger, StravaRateLimitError
 from utils import Activity, CustomGPX
 
 
@@ -168,6 +168,49 @@ class StravaApiTests(unittest.TestCase):
         uploaded_file = request.call_args.kwargs["files"]["file"]
         self.assertEqual(uploaded_file[0], "deleted.gpx")
         self.assertIsInstance(uploaded_file[1], bytes)
+
+    def test_successful_upload_survives_gear_update_rate_limit(self):
+        gpx = CustomGPX()
+        track = gpxpy.gpx.GPXTrack()
+        segment = gpxpy.gpx.GPXTrackSegment()
+        segment.points.append(gpxpy.gpx.GPXTrackPoint(47.0, 8.0))
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+        gpx.set_activity(
+            Activity(
+                name="Ride",
+                id=-1,
+                start_date="2026-08-13T07:00:00Z",
+                end_date="2026-08-13T08:00:00Z",
+                start_coords=(47.0, 8.0),
+                end_coords=(47.1, 8.1),
+                gear_id="bike-1",
+                sport="Ride",
+            )
+        )
+        upload_response = FakeResponse({"id": 77})
+        status_response = FakeResponse(
+            {"status": "Your activity is ready.", "activity_id": 987}
+        )
+
+        with (
+            patch("app.requests.post", return_value=upload_response),
+            patch.object(
+                self.merger,
+                "check_upload_status",
+                return_value=status_response,
+            ),
+            patch.object(
+                self.merger,
+                "update_activity_gear",
+                side_effect=StravaRateLimitError("rate limit reached"),
+            ),
+        ):
+            result = self.merger.upload_activities_to_strava([gpx])[0]
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.activity_id, 987)
+        self.assertEqual(gpx.activity.url, "https://www.strava.com/activities/987")
 
     def test_duplicate_activity_id_accepts_strava_html_link(self):
         error = (

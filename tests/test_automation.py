@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 import gpxpy.gpx
 
-from app import StravaMerger, UploadResult
+from app import StravaMerger, StravaRateLimitError, UploadResult
 from automation import (
+    AutomationSummary,
     JobStore,
     _address_for,
     _delete_mail_body,
@@ -18,6 +19,7 @@ from automation import (
     _load_replacement,
     _review_mail_body,
     _route_with_fallback,
+    _upload_jobs,
     run_automation,
 )
 from gpxfixer import GeocodingError, NoRouteError, Route, RouteError, TrackHole
@@ -140,6 +142,161 @@ class AutomationStateTests(unittest.TestCase):
             "Activity <a href='https://www.strava.com/activities/456'>456</a>",
             body,
         )
+
+    def test_partial_uploads_are_saved_and_emailed_before_rate_limit(self):
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        store = JobStore(state_path)
+        for source_id in (1, 2):
+            source = Activity(
+                name=f"Ride {source_id}",
+                id=source_id,
+                start_date="2026-08-13T07:00:00Z",
+                end_date="2026-08-13T08:00:00Z",
+                start_coords=(47.0, 8.0),
+                end_coords=(47.1, 8.1),
+                sport="Ride",
+            )
+            gpx = CustomGPX()
+            track = gpxpy.gpx.GPXTrack()
+            segment = gpxpy.gpx.GPXTrackSegment()
+            segment.points.append(gpxpy.gpx.GPXTrackPoint(47.0, 8.0))
+            track.segments.append(segment)
+            gpx.tracks.append(track)
+            gpx.set_activity(_fixed_activity(source, 1))
+            store.add(
+                job_id=f"fix-{source_id}",
+                kind="fix",
+                source_activities=[source],
+                replacement=gpx,
+            )
+
+        class Merger:
+            def __init__(self):
+                self.upload_calls = 0
+                self.emails = []
+
+            @staticmethod
+            def fixed_activity_name(source, gpx):
+                return source.name
+
+            def upload_activities_to_strava(self, gpxs):
+                self.upload_calls += 1
+                if self.upload_calls == 2:
+                    raise StravaRateLimitError("rate limit reached")
+                gpxs[0].activity.id = 901
+                gpxs[0].activity.url = "https://www.strava.com/activities/901"
+                return [
+                    UploadResult(
+                        gpx=gpxs[0],
+                        success=True,
+                        status="Your activity is ready.",
+                        activity_id=901,
+                    )
+                ]
+
+            def send_email(self, recipient, subject, body):
+                self.emails.append((recipient, subject, body))
+                return True
+
+        merger = Merger()
+        summary = AutomationSummary()
+        with self.assertRaisesRegex(StravaRateLimitError, "rate limit reached"):
+            _upload_jobs(
+                merger,
+                store,
+                ["fix-1", "fix-2"],
+                "me@example.com",
+                summary,
+            )
+
+        reloaded = JobStore(state_path)
+        self.assertEqual(reloaded.jobs["fix-1"]["status"], "uploaded")
+        self.assertEqual(reloaded.jobs["fix-2"]["status"], "ready")
+        self.assertEqual(
+            reloaded.jobs["fix-1"]["confirmation_notification_recipient"],
+            "me@example.com",
+        )
+        self.assertEqual(summary.uploaded_jobs, 1)
+        self.assertEqual(len(merger.emails), 1)
+        self.assertEqual(merger.emails[0][1], "StravaMerger - New activities")
+        self.assertIn("Strava activity 901", merger.emails[0][2])
+
+    def test_orphaned_upload_is_recovered_and_confirmed(self):
+        source = Activity(
+            name="Broken Ride",
+            id=10,
+            start_date="2026-08-13T07:00:00Z",
+            end_date="2026-08-13T08:00:00Z",
+            start_coords=(47.0, 8.0),
+            end_coords=(47.1, 8.1),
+            sport="Ride",
+        )
+        replacement = CustomGPX()
+        track = gpxpy.gpx.GPXTrack()
+        segment = gpxpy.gpx.GPXTrackSegment()
+        segment.points.append(gpxpy.gpx.GPXTrackPoint(47.0, 8.0))
+        track.segments.append(segment)
+        replacement.tracks.append(track)
+        replacement.set_activity(_fixed_activity(source, 1))
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        store = JobStore(state_path)
+        job = store.add(
+            job_id="fix-10",
+            kind="fix",
+            source_activities=[source],
+            replacement=replacement,
+        )
+        job["status"] = "manual_review"
+        job["last_error"] = "duplicate of activity 901"
+        store.save()
+
+        class Merger:
+            google_maps_api_key = None
+
+            def __init__(self):
+                self.emails = []
+
+            @staticmethod
+            def get_activity(activity_id):
+                if activity_id == 901:
+                    return {
+                        "id": 901,
+                        "external_id": "stravamerger-fix-10-v1",
+                        "description": "replacement",
+                    }
+                return None
+
+            @staticmethod
+            def activity_exists(activity_id):
+                return False
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+            def send_email(self, recipient, subject, body):
+                self.emails.append((recipient, subject, body))
+                return True
+
+        merger = Merger()
+        run_automation(
+            merger,
+            activities=[],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+
+        recovered = JobStore(state_path).jobs["fix-10"]
+        self.assertEqual(recovered["status"], "complete")
+        self.assertEqual(recovered["uploaded_activity_id"], 901)
+        self.assertEqual(
+            recovered["confirmation_notification_recipient"],
+            "me@example.com",
+        )
+        self.assertEqual(len(merger.emails), 1)
+        self.assertEqual(merger.emails[0][1], "StravaMerger - New activities")
+        self.assertIn("Strava activity 901", merger.emails[0][2])
 
     def test_address_lookup_failure_falls_back_to_coordinates(self):
         class Geocoder:
