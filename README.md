@@ -36,6 +36,11 @@ the surviving endpoints. It inserts the returned geometry into the original time
 window and linearly interpolates elevation. Existing points and their heart-rate and
 temperature extensions are retained.
 
+The two endpoints are reverse geocoded for console and deletion-email reporting, for
+example `1.35 km between Startstrasse 1, Zürich and Zielweg 2, Zürich`. Address lookup
+is best-effort: if Google returns no address or the Geocoding API is unavailable,
+StravaMerger reports endpoint coordinates and continues repairing the track.
+
 Repaired activities keep their existing name unless it is a generic `Fahrt am ...` or
 `Lauf am ...` name. Generic names are replaced when the track passes a location in
 `NAME_DICT` (for example, `IBM`); otherwise the generic name is retained.
@@ -62,20 +67,22 @@ duplicate. StravaMerger therefore uses this workflow:
 
 1. Save source GPX backups and the replacement GPX in `--ofolder`.
 2. Record a durable job in `<ofolder>/.stravamerger-state.json`.
-3. Email links to the source activities that must be deleted, including detected GPS
-   hole distances, when email is enabled.
+3. On every run, email the current list of source activities that still need action,
+   including detected GPS hole distances and addresses, when email is enabled.
 4. Attempt the replacement upload.
 5. If Strava reports a duplicate, wait for source deletion and retry the saved file on
    a later run.
 6. Email the new Strava link after a successful upload, when email is enabled.
 
-Deletion and upload-confirmation emails are recorded as delivered only after SMTP
-succeeds. A skipped notification is retried on a later run when email is enabled.
+Deletion reminders are deliberately sent again on every run while at least one source
+activity still exists. This makes each email a current checklist: deleted sources drop
+out, while unresolved sources remain. Upload-confirmation emails are sent once after
+SMTP succeeds; a skipped confirmation is retried on a later run.
 
-Do not delete the state file while jobs are pending. It prevents repeated repairs,
-merges, emails, and Google routing calls. Activities already checked and found clean
-are also recorded there. Delete the state file only when you intentionally want a full
-rescan.
+Do not delete the state file while jobs are pending. It keeps replacement and
+notification state consistent and prevents repeated repair generation and Google
+routing calls. Activities already checked and found clean are also recorded there.
+Delete the state file only when you intentionally want a full rescan.
 
 Replacing an activity does not preserve its kudos, comments, photos, existing segment
 results, or original device attribution. The original GPX backup remains in the output
@@ -114,10 +121,11 @@ writable. Keep it out of version control; `*secret.json` is ignored by this repo
 
 ### Google Maps
 
-Enable billing and the
-[Google Maps Routes API](https://developers.google.com/maps/documentation/routes) for
-the API key's Google Cloud project. Restrict the key to the Routes API and, where your
-deployment permits it, to the server's source IP.
+Enable billing, the
+[Google Maps Routes API](https://developers.google.com/maps/documentation/routes), and
+the [Geocoding API](https://developers.google.com/maps/documentation/geocoding/guides-v3/requests-reverse-geocoding)
+for the API key's Google Cloud project. Restrict the key to those two APIs and, where
+your deployment permits it, to the server's source IP.
 
 Store the key as `google_maps_api_key` in `secret.json`, as shown above.
 
@@ -125,7 +133,9 @@ Google Maps Platform usage is billable and governed by Google's current terms. I
 particular, review the applicable restrictions before storing routed geometry or using
 it outside a Google map. Hole filling is disabled by default; use `--fix-holes` to opt
 in after configuring Google. The merge automation continues to work without it.
-Hole endpoint coordinates are sent to Google whenever a route is requested.
+Each hole requires one route request and up to two separately billable reverse-geocoding
+requests. Hole endpoint coordinates are sent to Google for both operations. Repeated
+coordinates are looked up only once during a run.
 
 ### Email
 
@@ -192,17 +202,20 @@ launchd, or another scheduler. For example, this checks the latest activities ev
 hour:
 
 ```cron
-15 * * * * cd /absolute/path/to/stravamerger && /absolute/path/to/uv run stravamerger --credentials /absolute/path/to/secret.json --n_activities 21 --distance 500 --ofolder /absolute/path/to/data --recipient name@example.com --sender your-address@gmail.com
+15 * * * * cd /absolute/path/to/stravamerger && /absolute/path/to/uv run stravamerger --credentials /absolute/path/to/secret.json --n_activities 21 --distance 500 --ofolder /absolute/path/to/data --recipient name@example.com --sender your-address@gmail.com --fix-holes
 ```
 
 Use absolute paths in scheduled jobs. Keep the same `--ofolder` or explicit `--state`
-path between runs so pending uploads can resume.
+path between runs so pending uploads can resume. Because hole filling defaults to off,
+the scheduled command must include `--fix-holes` if it should discover new broken
+tracks. Already queued jobs still resume and generate reminders without that flag.
 
 ## Per-activity controls
 
 Add these case-insensitive markers to a Strava activity description:
 
-- `nomerge`: exclude the activity from both merge matching and GPS-hole repair;
+- `nomerge`: exclude the activity from both merge matching and GPS-hole repair, and
+  cancel a queued replacement on the next run;
 - `nofix`: exclude the activity from GPS-hole repair.
 
 Activities created by StravaMerger are automatically excluded from both operations.

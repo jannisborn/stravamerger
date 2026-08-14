@@ -10,12 +10,13 @@ import gpxpy.gpx
 from app import GPXTPX_NAMESPACE, StravaMerger, UploadResult
 from automation import (
     JobStore,
+    _address_for,
     _delete_mail_body,
     _fixed_activity,
     _load_replacement,
     run_automation,
 )
-from gpxfixer import Route
+from gpxfixer import GeocodingError, Route
 from utils import Activity, CustomGPX
 
 
@@ -68,6 +69,18 @@ class AutomationStateTests(unittest.TestCase):
         self.assertIn("Ride", email_body)
         self.assertIn("1.50 km", email_body)
 
+    def test_address_lookup_failure_falls_back_to_coordinates(self):
+        class Geocoder:
+            @staticmethod
+            def reverse_geocode(location):
+                raise GeocodingError("Geocoding API is unavailable")
+
+        with patch("automation.logger.warning") as warning:
+            address = _address_for((47.0, 8.0), Geocoder(), {})
+
+        self.assertEqual(address, "47.000000, 8.000000")
+        warning.assert_called_once()
+
     def test_completed_jobs_no_longer_claim_sources(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")
         with open(state_path, "w") as file:
@@ -77,11 +90,69 @@ class AutomationStateTests(unittest.TestCase):
                     "jobs": {
                         "fix-1": {"status": "complete", "source_ids": [1]},
                         "fix-2": {"status": "ready", "source_ids": [2]},
+                        "fix-3": {"status": "cancelled", "source_ids": [3]},
                     },
                 },
                 file,
             )
         self.assertEqual(JobStore(state_path).claimed_source_ids(), {2})
+
+    def test_current_nomerge_marker_cancels_a_queued_fix(self):
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        with open(state_path, "w") as file:
+            json.dump(
+                {
+                    "version": 1,
+                    "jobs": {
+                        "fix-10": {
+                            "id": "fix-10",
+                            "kind": "fix",
+                            "source_ids": [10],
+                            "sources": [{"id": 10, "name": "Old name"}],
+                            "status": "awaiting_deletion",
+                            "last_error": "duplicate of activity 10",
+                        }
+                    },
+                },
+                file,
+            )
+
+        activity = {
+            "id": 10,
+            "name": "Broken Ride",
+            "description": "Please NOMERGE this one",
+        }
+
+        class Merger:
+            google_maps_api_key = None
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+            can_fix_activity = staticmethod(StravaMerger.can_fix_activity)
+
+            @staticmethod
+            def send_email(*args, **kwargs):
+                raise AssertionError("A cancelled job must not send a reminder")
+
+            @staticmethod
+            def get_activity(activity_id):
+                return activity
+
+        with patch("automation.logger.info") as info:
+            run_automation(
+                Merger(),
+                activities=[],
+                output_folder=self.temporary_directory.name,
+                recipient="me@example.com",
+                state_path=state_path,
+                fix_holes=True,
+            )
+
+        job = JobStore(state_path).jobs["fix-10"]
+        self.assertEqual(job["status"], "cancelled")
+        self.assertEqual(info.call_args.args[1], "Broken Ride")
 
     def test_load_replacement_repairs_legacy_extension_namespace(self):
         source = Activity(
@@ -234,6 +305,16 @@ class AutomationStateTests(unittest.TestCase):
                     duration_seconds=100,
                 )
 
+        class Geocoder:
+            def __init__(self, api_key):
+                self.api_key = api_key
+
+            @staticmethod
+            def reverse_geocode(location):
+                if location == (47.0, 8.0):
+                    return "Startstrasse 1, Zürich"
+                return "Zielweg 2, Zürich"
+
         merger = Merger()
         state_path = os.path.join(self.temporary_directory.name, "state.json")
         disabled = run_automation(
@@ -248,6 +329,7 @@ class AutomationStateTests(unittest.TestCase):
 
         with (
             patch("automation.GoogleRoutesClient", Routes),
+            patch("automation.GoogleGeocodingClient", Geocoder),
             patch("automation.logger.info") as info,
         ):
             first = run_automation(
@@ -272,9 +354,11 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(
             hole_logs[0].args,
             (
-                'Detected GPS hole in "{}": {} straight-line gap.',
+                'Detected GPS hole in "{}": {} between {} and {}.',
                 "Broken Ride",
                 "1.35 km",
+                "Startstrasse 1, Zürich",
+                "Zielweg 2, Zürich",
             ),
         )
 
@@ -302,9 +386,25 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(len(merger.emails), 1)
         self.assertEqual(merger.emails[0][1], "StravaMerger - Delete source activities")
         self.assertIn("1.35 km", merger.emails[0][2])
+        self.assertIn("Startstrasse 1, Zürich", merger.emails[0][2])
+        self.assertIn("Zielweg 2, Zürich", merger.emails[0][2])
         self.assertEqual(
             JobStore(state_path).jobs["fix-10"]["delete_notification_recipient"],
             "me@example.com",
+        )
+
+        reminded_again = run_automation(
+            merger,
+            activities=[],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+        self.assertEqual(reminded_again.deferred_jobs, 1)
+        self.assertEqual(merger.upload_attempts, 1)
+        self.assertEqual(len(merger.emails), 2)
+        self.assertEqual(
+            merger.emails[1][1], "StravaMerger - Delete source activities"
         )
 
         merger.source_exists = False
@@ -323,9 +423,9 @@ class AutomationStateTests(unittest.TestCase):
             "me@example.com",
         )
         self.assertEqual(merger.upload_attempts, 2)
-        self.assertEqual(len(merger.emails), 2)
-        self.assertEqual(merger.emails[1][1], "StravaMerger - New activities")
-        self.assertIn("Broken Ride", merger.emails[1][2])
+        self.assertEqual(len(merger.emails), 3)
+        self.assertEqual(merger.emails[2][1], "StravaMerger - New activities")
+        self.assertIn("Broken Ride", merger.emails[2][2])
 
 
 if __name__ == "__main__":

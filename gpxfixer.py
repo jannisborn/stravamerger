@@ -14,6 +14,7 @@ import requests
 from utils import CustomGPX, haversine
 
 GOOGLE_ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+GOOGLE_GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 
 BICYCLE_SPORTS = {
     "EBikeRide",
@@ -38,6 +39,10 @@ MAX_ROUTE_FACTOR = 4.0
 
 class RouteError(RuntimeError):
     """Raised when a missing track section cannot be routed safely."""
+
+
+class GeocodingError(RuntimeError):
+    """Raised when a coordinate cannot be reverse geocoded."""
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,55 @@ class GoogleRoutesClient:
             ),
             duration_seconds=_parse_duration(route.get("duration", "0s")),
         )
+
+
+class GoogleGeocodingClient:
+    """Small client for Google Maps Geocoding API reverse lookups."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        timeout: float = 30.0,
+        session: requests.Session | None = None,
+    ) -> None:
+        if not api_key:
+            raise ValueError("A Google Maps API key is required for address lookup.")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.session = session or requests.Session()
+
+    def reverse_geocode(self, location: Sequence[float]) -> str | None:
+        """Return Google's closest formatted address, or ``None`` if none exists."""
+        latitude, longitude = map(float, location)
+        try:
+            response = self.session.get(
+                GOOGLE_GEOCODING_URL,
+                params={
+                    "latlng": f"{latitude:.7f},{longitude:.7f}",
+                    "key": self.api_key,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as error:
+            raise GeocodingError(
+                f"Google reverse-geocoding request failed: {error}"
+            ) from error
+
+        try:
+            body = response.json()
+        except ValueError as error:
+            raise GeocodingError("Google Geocoding returned invalid JSON.") from error
+        status = body.get("status")
+        if status == "ZERO_RESULTS":
+            return None
+        if status != "OK":
+            detail = body.get("error_message") or status or "unknown error"
+            raise GeocodingError(f"Google reverse geocoding failed: {detail}")
+        results = body.get("results") or []
+        address = results[0].get("formatted_address") if results else None
+        return address or None
 
 
 def validate_route(

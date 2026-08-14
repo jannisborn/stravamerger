@@ -314,8 +314,8 @@ class StravaMerger:
                 return route_name
         return activity.name
 
-    def activity_exists(self, activity_id: int) -> bool:
-        """Check whether an owned activity still exists on Strava."""
+    def get_activity(self, activity_id: int) -> dict[str, Any] | None:
+        """Fetch an owned activity, returning ``None`` after it is deleted."""
         response = requests.get(
             self.SINGLE_ACTIVITY_URL.format(activity_id),
             headers={"Authorization": f"Bearer {self.access_token}"},
@@ -323,9 +323,13 @@ class StravaMerger:
         )
         self.check_rate_limit(response)
         if response.status_code == 404:
-            return False
+            return None
         response.raise_for_status()
-        return True
+        return response.json()
+
+    def activity_exists(self, activity_id: int) -> bool:
+        """Check whether an owned activity still exists on Strava."""
+        return self.get_activity(activity_id) is not None
 
     def detect_merging_activities(
         self, activities: list[dict[str, Any]]

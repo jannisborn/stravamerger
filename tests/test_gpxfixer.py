@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 import gpxpy.gpx
 
 from gpxfixer import (
+    GOOGLE_GEOCODING_URL,
     GOOGLE_ROUTES_URL,
+    GoogleGeocodingClient,
     GoogleRoutesClient,
     Route,
     RouteError,
@@ -153,6 +155,35 @@ class GpxFixerTests(unittest.TestCase):
         self.assertEqual(session.kwargs["json"]["polylineQuality"], "HIGH_QUALITY")
         self.assertEqual(session.kwargs["headers"]["X-Goog-Api-Key"], "not-a-real-key")
         self.assertGreaterEqual(route.distance_meters, 1000)
+
+    def test_google_reverse_geocoding_returns_formatted_address(self):
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "status": "OK",
+                    "results": [{"formatted_address": "Example Street 1, 8000 Zürich"}],
+                }
+
+        class Session:
+            def get(self, url, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return Response()
+
+        session = Session()
+        client = GoogleGeocodingClient("not-a-real-key", session=session)
+
+        address = client.reverse_geocode((47.3769, 8.5417))
+
+        self.assertEqual(address, "Example Street 1, 8000 Zürich")
+        self.assertEqual(session.url, GOOGLE_GEOCODING_URL)
+        self.assertEqual(session.kwargs["params"]["latlng"], "47.3769000,8.5417000")
+        self.assertEqual(session.kwargs["params"]["key"], "not-a-real-key")
 
 
 if __name__ == "__main__":
