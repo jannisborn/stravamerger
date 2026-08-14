@@ -7,6 +7,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from itertools import pairwise
+from math import ceil
 
 import gpxpy.gpx
 import requests
@@ -35,10 +36,19 @@ WALK_SPORTS = {
 SUPPORTED_TRAVEL_MODES = {"BICYCLE", "DRIVE", "TWO_WHEELER", "WALK"}
 MAX_HOLE_DISTANCE = 20_000.0
 MAX_ROUTE_FACTOR = 4.0
+MAX_STRAIGHT_LINE_POINT_INTERVAL_SECONDS = 3.0
 
 
 class RouteError(RuntimeError):
     """Raised when a missing track section cannot be routed safely."""
+
+
+class NoRouteError(RouteError):
+    """Raised when Google returns no usable route geometry."""
+
+
+class RouteTooIndirectError(RouteError):
+    """Raised when a Google route is implausibly longer than the direct gap."""
 
 
 class GeocodingError(RuntimeError):
@@ -208,11 +218,11 @@ class GoogleRoutesClient:
         except ValueError as error:
             raise RouteError("Google Routes returned invalid JSON.") from error
         if not body.get("routes"):
-            raise RouteError("Google Routes returned no route.")
+            raise NoRouteError("Google Routes returned no route.")
         route = body["routes"][0]
         encoded = route.get("polyline", {}).get("encodedPolyline")
         if not encoded:
-            raise RouteError("Google Routes returned no route geometry.")
+            raise NoRouteError("Google Routes returned no route geometry.")
 
         decoded = decode_google_polyline(encoded)
         points = _with_exact_endpoints(tuple(origin), tuple(destination), decoded)
@@ -286,12 +296,33 @@ def validate_route(
             f"{MAX_HOLE_DISTANCE:.0f} m safety limit."
         )
     if route.distance_meters > hole.distance_meters * MAX_ROUTE_FACTOR:
-        raise RouteError(
+        raise RouteTooIndirectError(
             f"{route.distance_meters:.0f} m route is more than {MAX_ROUTE_FACTOR:g}x "
             f"the {hole.distance_meters:.0f} m straight-line gap."
         )
     if len(route.points) < 3:
-        raise RouteError("The route contains no points between the gap endpoints.")
+        raise NoRouteError("The route contains no points between the gap endpoints.")
+
+
+def straight_line_route(hole: TrackHole) -> Route:
+    """Create direct-line coordinates at intervals of at most three seconds."""
+    steps = max(
+        2, ceil(hole.elapsed_seconds / MAX_STRAIGHT_LINE_POINT_INTERVAL_SECONDS)
+    )
+    latitude_delta = hole.destination[0] - hole.origin[0]
+    longitude_delta = hole.destination[1] - hole.origin[1]
+    points = tuple(
+        (
+            hole.origin[0] + latitude_delta * step / steps,
+            hole.origin[1] + longitude_delta * step / steps,
+        )
+        for step in range(steps + 1)
+    )
+    return Route(
+        points=points,
+        distance_meters=hole.distance_meters,
+        duration_seconds=hole.elapsed_seconds,
+    )
 
 
 def repair_holes(

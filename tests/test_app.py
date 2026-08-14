@@ -136,15 +136,13 @@ class StravaApiTests(unittest.TestCase):
         self.assertFalse(self.merger.has_read_capacity(2, reserve=10))
 
     def test_synchronous_duplicate_upload_is_returned_without_retry_loop(self):
-        filepath = os.path.join(self.temporary_directory.name, "replacement.gpx")
+        filepath = os.path.join(self.temporary_directory.name, "deleted.gpx")
         gpx = CustomGPX()
         track = gpxpy.gpx.GPXTrack()
         segment = gpxpy.gpx.GPXTrackSegment()
         track.segments.append(segment)
         gpx.tracks.append(track)
         segment.points.append(gpxpy.gpx.GPXTrackPoint(47.0, 8.0))
-        with open(filepath, "w") as file:
-            file.write(gpx.to_xml())
         gpx.set_activity(
             Activity(
                 name="Ride",
@@ -162,11 +160,14 @@ class StravaApiTests(unittest.TestCase):
             status_code=400,
         )
 
-        with patch("app.requests.post", return_value=response):
+        with patch("app.requests.post", return_value=response) as request:
             result = self.merger.upload_activities_to_strava([gpx])[0]
 
         self.assertFalse(result.success)
         self.assertEqual(result.activity_id, 987654)
+        uploaded_file = request.call_args.kwargs["files"]["file"]
+        self.assertEqual(uploaded_file[0], "deleted.gpx")
+        self.assertIsInstance(uploaded_file[1], bytes)
 
     def test_duplicate_activity_id_accepts_strava_html_link(self):
         error = (

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -14,16 +15,20 @@ from typing import Any
 import gpxpy
 from loguru import logger
 
-from app import BOT_MARKER, GPXTPX_NAMESPACE, StravaMerger
+from app import BOT_MARKER, StravaMerger
 from gpxfixer import (
     MAX_HOLE_DISTANCE,
     GeocodingError,
     GoogleGeocodingClient,
     GoogleRoutesClient,
+    NoRouteError,
+    Route,
     RouteError,
+    RouteTooIndirectError,
     TrackHole,
     detect_holes,
     repair_holes,
+    straight_line_route,
     travel_mode_for_sport,
     validate_route,
 )
@@ -31,6 +36,7 @@ from utils import Activity, CustomGPX
 
 MAX_HOLES_PER_ACTIVITY = 5
 READ_REQUEST_RESERVE = 10
+ACTIVITY_ID_PATTERN = re.compile(r"\b([Aa]ctivity) (\d+)\b")
 
 
 @dataclass
@@ -87,6 +93,10 @@ class JobStore:
         }
         self.save()
 
+    def clear_review(self, activity_id: int) -> None:
+        if self.data["reviews"].pop(str(activity_id), None) is not None:
+            self.save()
+
     def add(
         self,
         *,
@@ -98,7 +108,11 @@ class JobStore:
         hole_details: dict[int, list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         replacement_data = asdict(replacement.activity)
-        replacement_data["filepath"] = os.path.abspath(replacement.activity.filepath)
+        replacement_data["filepath"] = (
+            os.path.abspath(replacement.activity.filepath)
+            if replacement.activity.filepath
+            else None
+        )
         hole_distances_meters = hole_distances_meters or {}
         hole_details = hole_details or {}
         job = {
@@ -118,6 +132,7 @@ class JobStore:
                 for source in source_activities
             },
             "replacement": replacement_data,
+            "replacement_gpx": replacement.to_xml(),
             "status": "ready",
             "delete_notified": False,
             "delete_notification_recipient": None,
@@ -190,9 +205,27 @@ def run_automation(
         source_exists_cache=source_exists_cache,
     )
 
+    rebuild_source_ids = {
+        source_id
+        for job in store.jobs.values()
+        if job.get("rebuild_required")
+        for source_id in job["source_ids"]
+    }
     claimed = store.claimed_source_ids()
     available = [activity for activity in activities if activity["id"] not in claimed]
+    available_ids = {activity["id"] for activity in available}
+    available.extend(
+        activities_by_id[source_id]
+        for source_id in rebuild_source_ids
+        if source_id not in available_ids and source_id in activities_by_id
+    )
+    available.sort(key=lambda activity: activity["id"] not in rebuild_source_ids)
     merge_chains = merger.detect_merging_activities(available)
+    merge_chains.sort(
+        key=lambda chain: not any(
+            activity.id in rebuild_source_ids for activity in chain
+        )
+    )
     merged_source_ids = {activity.id for chain in merge_chains for activity in chain}
     google_client = None
     geocoding_client = None
@@ -221,8 +254,15 @@ def run_automation(
             marker in activity.description.lower() for marker in ("nofix", "nomerge")
         ):
             return gpx, []
-        if store.review_reason(activity.id):
-            return None, []
+        previous_review = store.review_reason(activity.id)
+        if previous_review:
+            if not _review_can_use_straight_line(previous_review):
+                return None, []
+            logger.info(
+                'Retrying "{}" because straight-line fallback is now available.',
+                activity.name,
+            )
+            store.clear_review(activity.id)
         holes = detect_holes(
             gpx,
             time_threshold=hole_time_threshold,
@@ -281,9 +321,22 @@ def run_automation(
                         f"{hole.distance_meters:.0f} m straight-line gap exceeds the "
                         f"{MAX_HOLE_DISTANCE:.0f} m safety limit."
                     )
-            for hole in holes:
-                route = google_client.route(hole.origin, hole.destination, mode)
-                validate_route(hole, route)
+            for hole, detail in zip(holes, hole_details):
+                route, fallback_reason = _route_with_fallback(
+                    google_client, hole, mode
+                )
+                if fallback_reason:
+                    detail["repair_method"] = "straight_line"
+                    detail["fallback_reason"] = fallback_reason
+                    logger.warning(
+                        'Using straight-line GPX coordinates in "{}" for {} between '
+                        "{} and {} because {}",
+                        activity.name,
+                        _format_distance(detail["distance_meters"]),
+                        detail["origin_address"],
+                        detail["destination_address"],
+                        fallback_reason,
+                    )
                 repairs.append((hole, route))
         except RouteError as error:
             message = (
@@ -328,7 +381,7 @@ def run_automation(
             merger.activity_from_api(activity) for activity in detailed_activities
         ]
         if any(
-            store.review_reason(activity.id)
+            _review_blocks_retry(store, activity.id)
             and "nofix" not in activity.description.lower()
             for activity in chain
         ):
@@ -384,7 +437,7 @@ def run_automation(
                 and not merger.can_fix_activity(api_activity)
             )
             or store.was_checked_clean(api_activity["id"])
-            or store.review_reason(api_activity["id"])
+            or _review_blocks_retry(store, api_activity["id"])
         ):
             continue
         requests_needed = 1 + _activity_detail_request_needed(
@@ -475,9 +528,13 @@ def _resume_jobs(
                     "description", source.get("description", "")
                 ) or ""
         opt_out = _job_opt_out(job, activities_by_id)
-        if opt_out and job["status"] in {"awaiting_deletion", "ready"}:
+        if opt_out and (
+            job["status"] in {"awaiting_deletion", "ready"}
+            or job.get("rebuild_required")
+        ):
             activity_name, marker = opt_out
             job["status"] = "cancelled"
+            job.pop("rebuild_required", None)
             job["last_error"] = (
                 f'Cancelled because "{activity_name}" contains {marker}.'
             )
@@ -487,6 +544,39 @@ def _resume_jobs(
                 activity_name,
                 marker,
             )
+            continue
+        if (
+            job["status"] in {"awaiting_deletion", "ready"}
+            and not job.get("replacement_gpx")
+        ):
+            source_exists = any(
+                _source_exists(merger, source_id, source_exists_cache)
+                for source_id in job["source_ids"]
+            )
+            source_names = " & ".join(
+                source.get("name", "Unnamed activity") for source in job["sources"]
+            )
+            job["updated_at"] = _now()
+            if source_exists:
+                job["status"] = "cancelled"
+                job["rebuild_required"] = True
+                job["last_error"] = (
+                    "Queued replacement had no embedded data and will be rebuilt."
+                )
+                logger.warning(
+                    'Rebuilding queued replacement for "{}" because its embedded '
+                    "data is missing.",
+                    source_names,
+                )
+            else:
+                job["status"] = "manual_review"
+                job["last_error"] = (
+                    "Replacement data is missing and no source activity remains."
+                )
+                summary.review_messages.append(
+                    f"{source_names}: replacement data is missing and the source "
+                    "activity no longer exists."
+                )
             continue
         if job["status"] == "cancelled":
             continue
@@ -606,7 +696,10 @@ def _refresh_pending_source_activities(
     if not callable(get_activity):
         return
     for job in store.jobs.values():
-        if job["status"] not in {"awaiting_deletion", "ready", "uploaded"}:
+        if (
+            job["status"] not in {"awaiting_deletion", "ready", "uploaded"}
+            and not job.get("rebuild_required")
+        ):
             continue
         for source_id in job["source_ids"]:
             activity = activities_by_id.get(source_id)
@@ -669,17 +762,6 @@ def _notify_deletions(
     existing_source_ids: set[int] | None = None,
 ) -> None:
     jobs = [store.jobs[job_id] for job_id in job_ids]
-    geocoding_client = (
-        GoogleGeocodingClient(merger.google_maps_api_key)
-        if merger.google_maps_api_key
-        else None
-    )
-    address_cache: dict[tuple[float, float], str] = {}
-    backfilled = [
-        _backfill_hole_details(job, geocoding_client, address_cache) for job in jobs
-    ]
-    if any(backfilled):
-        store.save()
     delivered = merger.send_email(
         recipient,
         subject="StravaMerger - Delete source activities",
@@ -793,12 +875,9 @@ def _fixed_activity(
 
 
 def _load_replacement(job: dict[str, Any]) -> CustomGPX:
-    filepath = job["replacement"]["filepath"]
-    xml = _repair_legacy_extension_file(filepath)
-    for source_id in job["source_ids"]:
-        source_path = _source_backup_path(job, source_id)
-        if source_path and os.path.isfile(source_path):
-            _repair_legacy_extension_file(source_path)
+    xml = job.get("replacement_gpx")
+    if not xml:
+        raise ValueError("Queued job has no embedded replacement GPX data.")
     parsed = gpxpy.parse(xml)
     gpx = CustomGPX()
     gpx.creator = parsed.creator
@@ -811,82 +890,33 @@ def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     return gpx
 
 
-def _backfill_hole_details(
-    job: dict[str, Any],
-    client: GoogleGeocodingClient | None,
-    cache: dict[tuple[float, float], str],
-) -> bool:
-    """Populate structured hole details for jobs created before they were persisted."""
-    if "hole_details" in job:
-        return False
-    details_by_source = {}
-    distances_by_source = {}
-    for source in job["sources"]:
-        source_path = _source_backup_path(job, source["id"])
-        if not source_path or not os.path.isfile(source_path):
-            details_by_source[str(source["id"])] = []
-            distances_by_source[str(source["id"])] = []
-            continue
-        xml = _repair_legacy_extension_file(source_path)
-        source_gpx = gpxpy.parse(xml)
-        details = [
-            _describe_hole(hole, client, cache) for hole in detect_holes(source_gpx)
-        ]
-        details_by_source[str(source["id"])] = details
-        distances_by_source[str(source["id"])] = [
-            detail["distance_meters"] for detail in details
-        ]
-    job["hole_details"] = details_by_source
-    job.setdefault("hole_distances_meters", distances_by_source)
-    return True
-
-
-def _source_backup_path(job: dict[str, Any], source_id: int) -> str | None:
-    replacement_path = job["replacement"]["filepath"]
-    replacement_name = os.path.basename(replacement_path)
-    if not replacement_name.endswith("_replacement.gpx"):
-        return None
-    prefix = replacement_name.removesuffix("_replacement.gpx")
-    return os.path.join(
-        os.path.dirname(replacement_path),
-        f"{prefix}_source_{source_id}.gpx",
-    )
-
-
-def _repair_legacy_extension_file(filepath: str) -> str:
-    """Repair GPX files written with the legacy gpxtpx namespace bug."""
-    with open(filepath, "r", encoding="utf-8") as file:
-        xml = file.read()
-    legacy_prefix = f"{GPXTPX_NAMESPACE}:"
-    if f"<{legacy_prefix}" not in xml and f"</{legacy_prefix}" not in xml:
-        return xml
-
-    repaired = xml.replace(f"<{legacy_prefix}", "<gpxtpx:")
-    repaired = repaired.replace(f"</{legacy_prefix}", "</gpxtpx:")
-    if "xmlns:gpxtpx=" not in repaired:
-        repaired = repaired.replace(
-            "<gpx ",
-            f'<gpx xmlns:gpxtpx="{GPXTPX_NAMESPACE}" ',
-            1,
-        )
-    gpxpy.parse(repaired)
-
-    directory = os.path.dirname(os.path.abspath(filepath))
-    descriptor, temporary_path = tempfile.mkstemp(
-        dir=directory,
-        prefix=".stravamerger-gpx-",
-        text=True,
-    )
+def _route_with_fallback(
+    client: GoogleRoutesClient,
+    hole: TrackHole,
+    travel_mode: str,
+) -> tuple[Route, str | None]:
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            file.write(repaired)
-        os.replace(temporary_path, filepath)
-    except Exception:
-        if os.path.exists(temporary_path):
-            os.unlink(temporary_path)
-        raise
-    logger.warning("Repaired legacy GPX extension namespaces in {}", filepath)
-    return repaired
+        route = client.route(hole.origin, hole.destination, travel_mode)
+        validate_route(hole, route)
+    except (NoRouteError, RouteTooIndirectError) as error:
+        return straight_line_route(hole), str(error)
+    return route, None
+
+
+def _review_can_use_straight_line(reason: str) -> bool:
+    return any(
+        marker in reason
+        for marker in (
+            "Google Routes returned no route",
+            "route is more than 4x",
+            "route contains no points between the gap endpoints",
+        )
+    )
+
+
+def _review_blocks_retry(store: JobStore, activity_id: int) -> bool:
+    reason = store.review_reason(activity_id)
+    return bool(reason and not _review_can_use_straight_line(reason))
 
 
 def _delete_mail_body(
@@ -922,12 +952,7 @@ def _delete_mail_body(
             if hole_details:
                 label = "GPS hole" if len(hole_details) == 1 else "GPS holes"
                 detail_text = "; ".join(
-                    (
-                        f"{_format_distance(detail['distance_meters'])} between "
-                        f"{detail['origin_address']} and "
-                        f"{detail['destination_address']}"
-                    )
-                    for detail in hole_details
+                    _format_hole_detail(detail) for detail in hole_details
                 )
                 details = f"{label}: {detail_text}"
             elif distances:
@@ -941,7 +966,8 @@ def _delete_mail_body(
             else:
                 details = "no GPS hole; merge replacement"
             body.append(
-                f"<li><a href='{url}'>{escape(source['name'])}</a> "
+                f"<li>{escape(source['name'])} &mdash; "
+                f"<a href='{url}'>Strava activity {source['id']}</a> "
                 f"({escape(details)})</li>"
             )
     body.append("</ul></body></html>")
@@ -953,14 +979,16 @@ def _confirmation_mail_body(jobs: list[dict[str, Any]]) -> str:
     for job in jobs:
         activity = job["replacement"]
         body.append(
-            f"<li><a href='{escape(activity['url'])}'>{escape(activity['name'])}</a></li>"
+            f"<li>{escape(activity['name'])} &mdash; "
+            f"<a href='{escape(activity['url'])}'>Strava activity "
+            f"{activity['id']}</a></li>"
         )
     body.append("</ul></body></html>")
     return "".join(body)
 
 
 def _review_mail_body(messages: list[str]) -> str:
-    items = "".join(f"<li>{escape(message)}</li>" for message in messages)
+    items = "".join(f"<li>{_link_activity_ids(message)}</li>" for message in messages)
     return f"<html><body><p>These tracks were left unchanged:</p><ul>{items}</ul></body></html>"
 
 
@@ -972,6 +1000,29 @@ def _format_distance(distance_meters: float) -> str:
     if distance_meters >= 1_000:
         return f"{distance_meters / 1_000:.2f} km"
     return f"{distance_meters:.0f} m"
+
+
+def _format_hole_detail(detail: dict[str, Any]) -> str:
+    text = (
+        f"{_format_distance(detail['distance_meters'])} between "
+        f"{detail['origin_address']} and {detail['destination_address']}"
+    )
+    if detail.get("repair_method") == "straight_line":
+        text += ". Straight-line GPX coordinates were used"
+        if detail.get("fallback_reason"):
+            text += f" because {detail['fallback_reason']}"
+    return text
+
+
+def _link_activity_ids(message: str) -> str:
+    escaped_message = escape(message)
+
+    def replace(match: re.Match[str]) -> str:
+        label, activity_id = match.groups()
+        url = f"https://www.strava.com/activities/{activity_id}"
+        return f"{label} <a href='{url}'>{activity_id}</a>"
+
+    return ACTIVITY_ID_PATTERN.sub(replace, escaped_message)
 
 
 def _describe_hole(

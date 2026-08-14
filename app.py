@@ -861,16 +861,11 @@ class StravaMerger:
         results = []
         for i, gpx in enumerate(filedata):
             filepath = gpx.activity.filepath
-            if not filepath or not os.path.exists(filepath):
-                results.append(
-                    UploadResult(
-                        gpx=gpx,
-                        success=False,
-                        status="missing_file",
-                        error=f"Replacement file does not exist: {filepath}",
-                    )
-                )
-                continue
+            filename = (
+                os.path.basename(filepath)
+                if filepath
+                else f"stravamerger-{i + 1}.gpx"
+            )
 
             data = {
                 "data_type": data_type,
@@ -882,18 +877,21 @@ class StravaMerger:
                 "external_id": gpx.activity.external_id,
             }
             try:
-                with open(filepath, "rb") as upload_file:
-                    response = requests.post(
-                        self.UPLOAD_URL,
-                        headers={"Authorization": f"Bearer {self.access_token}"},
-                        files={"file": upload_file},
-                        data={
-                            key: value
-                            for key, value in data.items()
-                            if value is not None
-                        },
-                        timeout=30,
-                    )
+                response = requests.post(
+                    self.UPLOAD_URL,
+                    headers={"Authorization": f"Bearer {self.access_token}"},
+                    files={
+                        "file": (
+                            filename,
+                            gpx.to_xml().encode("utf-8"),
+                            "application/gpx+xml",
+                        )
+                    },
+                    data={
+                        key: value for key, value in data.items() if value is not None
+                    },
+                    timeout=30,
+                )
                 self.check_rate_limit(response)
                 if response.status_code >= 300:
                     try:

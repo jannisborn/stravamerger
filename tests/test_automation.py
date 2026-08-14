@@ -9,16 +9,18 @@ from unittest.mock import patch
 
 import gpxpy.gpx
 
-from app import GPXTPX_NAMESPACE, StravaMerger, UploadResult
+from app import StravaMerger, UploadResult
 from automation import (
     JobStore,
     _address_for,
     _delete_mail_body,
     _fixed_activity,
     _load_replacement,
+    _review_mail_body,
+    _route_with_fallback,
     run_automation,
 )
-from gpxfixer import GeocodingError, Route
+from gpxfixer import GeocodingError, NoRouteError, Route, RouteError, TrackHole
 from utils import Activity, CustomGPX
 
 
@@ -58,9 +60,21 @@ class AutomationStateTests(unittest.TestCase):
             source_activities=[source],
             replacement=gpx,
             hole_distances_meters={123: [1_500.25]},
+            hole_details={
+                123: [
+                    {
+                        "distance_meters": 1_500.25,
+                        "origin_address": "Start Street",
+                        "destination_address": "End Street",
+                        "repair_method": "straight_line",
+                        "fallback_reason": "Google Routes returned no route.",
+                    }
+                ]
+            },
         )
 
         loaded_store = JobStore(state_path)
+        os.unlink(gpx_path)
         self.assertEqual(loaded_store.claimed_source_ids(), {123})
         loaded_gpx = _load_replacement(loaded_store.jobs["fix-123"])
         self.assertEqual(loaded_gpx.activity.source_ids, [123])
@@ -70,6 +84,62 @@ class AutomationStateTests(unittest.TestCase):
         email_body = _delete_mail_body([loaded_store.jobs["fix-123"]])
         self.assertIn("Ride", email_body)
         self.assertIn("1.50 km", email_body)
+        self.assertIn("Straight-line GPX coordinates were used", email_body)
+        self.assertIn("Google Routes returned no route", email_body)
+        self.assertIn(
+            "href='https://www.strava.com/activities/123'>Strava activity 123</a>",
+            email_body,
+        )
+
+    def test_routing_fallback_is_limited_to_no_route_or_indirect_route(self):
+        hole = TrackHole(
+            track_index=0,
+            segment_index=0,
+            point_index=1,
+            elapsed_seconds=120,
+            distance_meters=1_000,
+            origin=(47.0, 8.0),
+            destination=(47.01, 8.01),
+        )
+
+        class NoRoutes:
+            @staticmethod
+            def route(*args):
+                raise NoRouteError("Google Routes returned no route.")
+
+        route, reason = _route_with_fallback(NoRoutes(), hole, "BICYCLE")
+        self.assertEqual(route.points[0], hole.origin)
+        self.assertEqual(route.points[-1], hole.destination)
+        self.assertIn("no route", reason)
+
+        class IndirectRoute:
+            @staticmethod
+            def route(*args):
+                return Route(
+                    points=(hole.origin, (48.0, 9.0), hole.destination),
+                    distance_meters=4_001,
+                    duration_seconds=120,
+                )
+
+        route, reason = _route_with_fallback(IndirectRoute(), hole, "BICYCLE")
+        self.assertEqual(route.distance_meters, hole.distance_meters)
+        self.assertIn("more than 4x", reason)
+
+        class ApiFailure:
+            @staticmethod
+            def route(*args):
+                raise RouteError("Google Routes request failed: quota exceeded")
+
+        with self.assertRaisesRegex(RouteError, "quota exceeded"):
+            _route_with_fallback(ApiFailure(), hole, "BICYCLE")
+
+    def test_review_mail_links_activity_id(self):
+        body = _review_mail_body(["Activity 456 was not repaired"])
+
+        self.assertIn(
+            "Activity <a href='https://www.strava.com/activities/456'>456</a>",
+            body,
+        )
 
     def test_address_lookup_failure_falls_back_to_coordinates(self):
         class Geocoder:
@@ -226,6 +296,56 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(job["status"], "cancelled")
         self.assertEqual(info.call_args.args[1], "Broken Ride")
 
+    def test_file_only_job_is_marked_for_rebuild_without_opening_gpx(self):
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        with open(state_path, "w") as file:
+            json.dump(
+                {
+                    "version": 1,
+                    "jobs": {
+                        "fix-10": {
+                            "id": "fix-10",
+                            "kind": "fix",
+                            "source_ids": [10],
+                            "sources": [
+                                {
+                                    "id": 10,
+                                    "name": "Broken Ride",
+                                    "description": "",
+                                }
+                            ],
+                            "replacement": {
+                                "filepath": "/path/that/does/not/exist.gpx"
+                            },
+                            "status": "ready",
+                            "last_error": None,
+                            "hole_details": {"10": []},
+                            "hole_distances_meters": {"10": [500]},
+                        }
+                    },
+                },
+                file,
+            )
+
+        class Merger:
+            google_maps_api_key = None
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+        run_automation(
+            Merger(),
+            activities=[{"id": 10, "name": "Broken Ride", "description": ""}],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+
+        job = JobStore(state_path).jobs["fix-10"]
+        self.assertEqual(job["status"], "cancelled")
+        self.assertTrue(job["rebuild_required"])
+
     def test_pending_reminder_is_sent_before_new_activity_scan(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")
         with open(state_path, "w") as file:
@@ -248,6 +368,10 @@ class AutomationStateTests(unittest.TestCase):
                             "last_error": "duplicate of activity 10",
                             "hole_details": {"10": []},
                             "hole_distances_meters": {"10": [500]},
+                            "replacement_gpx": (
+                                '<gpx xmlns="http://www.topografix.com/GPX/1/1" '
+                                'version="1.1" creator="test" />'
+                            ),
                         }
                     },
                 },
@@ -284,56 +408,6 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(
             merger.emails[0][1], "StravaMerger - Delete source activities"
         )
-
-    def test_load_replacement_repairs_legacy_extension_namespace(self):
-        source = Activity(
-            name="Ride",
-            id=123,
-            start_date="2026-08-13T07:00:00Z",
-            end_date="2026-08-13T08:00:00Z",
-            start_coords=(47.0, 8.0),
-            end_coords=(47.1, 8.1),
-            sport="Ride",
-        )
-        replacement = _fixed_activity(source, 1)
-        filepath = os.path.join(
-            self.temporary_directory.name,
-            "fix-123_replacement.gpx",
-        )
-        malformed = f"""<?xml version="1.0" encoding="UTF-8"?>
-<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1" creator="test">
-  <trk><trkseg><trkpt lat="47.0" lon="8.0"><extensions>
-    <{GPXTPX_NAMESPACE}:TrackPointExtension>
-      <{GPXTPX_NAMESPACE}:hr>120</{GPXTPX_NAMESPACE}:hr>
-    </{GPXTPX_NAMESPACE}:TrackPointExtension>
-  </extensions></trkpt></trkseg></trk>
-</gpx>"""
-        with open(filepath, "w") as file:
-            file.write(malformed)
-        source_filepath = os.path.join(
-            self.temporary_directory.name,
-            "fix-123_source_123.gpx",
-        )
-        with open(source_filepath, "w") as file:
-            file.write(malformed)
-        replacement.filepath = filepath
-        job = {
-            "source_ids": [123],
-            "replacement": replacement.__dict__,
-        }
-
-        loaded = _load_replacement(job)
-
-        self.assertEqual(loaded.activity.source_ids, (123,))
-        with open(filepath) as file:
-            repaired = file.read()
-        self.assertIn("xmlns:gpxtpx=", repaired)
-        self.assertIn("<gpxtpx:hr>120</gpxtpx:hr>", repaired)
-        gpxpy.parse(repaired)
-        with open(source_filepath) as file:
-            repaired_source = file.read()
-        self.assertIn("xmlns:gpxtpx=", repaired_source)
-        gpxpy.parse(repaired_source)
 
     def test_duplicate_repair_resumes_after_source_deletion(self):
         api_activity = {
@@ -432,7 +506,7 @@ class AutomationStateTests(unittest.TestCase):
             def route(self, origin, destination, travel_mode):
                 return Route(
                     points=(origin, (47.005, 8.005), destination),
-                    distance_meters=1_500,
+                    distance_meters=6_000,
                     duration_seconds=100,
                 )
 
@@ -457,11 +531,17 @@ class AutomationStateTests(unittest.TestCase):
         )
         self.assertEqual(disabled.repaired_jobs, 0)
         self.assertEqual(merger.upload_attempts, 0)
+        JobStore(state_path).mark_for_review(
+            10,
+            "Activity 10 (Broken Ride) was not repaired: 6000 m route is more "
+            "than 4x the 1345 m straight-line gap.",
+        )
 
         with (
             patch("automation.GoogleRoutesClient", Routes),
             patch("automation.GoogleGeocodingClient", Geocoder),
             patch("automation.logger.info") as info,
+            patch("automation.logger.warning") as warning,
         ):
             first = run_automation(
                 merger,
@@ -477,6 +557,10 @@ class AutomationStateTests(unittest.TestCase):
         job = JobStore(state_path).jobs["fix-10"]
         self.assertEqual(job["status"], "awaiting_deletion")
         self.assertIsNone(job["delete_notification_recipient"])
+        self.assertIsNone(JobStore(state_path).review_reason(10))
+        hole_detail = job["hole_details"]["10"][0]
+        self.assertEqual(hole_detail["repair_method"], "straight_line")
+        self.assertIn("more than 4x", hole_detail["fallback_reason"])
         hole_logs = [
             call
             for call in info.call_args_list
@@ -492,17 +576,12 @@ class AutomationStateTests(unittest.TestCase):
                 "Zielweg 2, Zürich",
             ),
         )
-
-        legacy_store = JobStore(state_path)
-        legacy_job = legacy_store.jobs["fix-10"]
-        legacy_job["status"] = "ready"
-        legacy_job["last_error"] = (
-            "replacement.gpx duplicate of " "<a href='/activities/10'>Broken Ride</a>"
-        )
-        legacy_job["delete_notified"] = True
-        legacy_job.pop("delete_notification_recipient")
-        legacy_job.pop("hole_distances_meters")
-        legacy_store.save()
+        fallback_logs = [
+            call
+            for call in warning.call_args_list
+            if call.args and call.args[0].startswith("Using straight-line")
+        ]
+        self.assertEqual(len(fallback_logs), 1)
 
         merger.email_enabled = True
         notified = run_automation(
@@ -519,6 +598,8 @@ class AutomationStateTests(unittest.TestCase):
         self.assertIn("1.35 km", merger.emails[0][2])
         self.assertIn("Startstrasse 1, Zürich", merger.emails[0][2])
         self.assertIn("Zielweg 2, Zürich", merger.emails[0][2])
+        self.assertIn("Straight-line GPX coordinates were used", merger.emails[0][2])
+        self.assertIn("more than 4x", merger.emails[0][2])
         self.assertEqual(
             JobStore(state_path).jobs["fix-10"]["delete_notification_recipient"],
             "me@example.com",
@@ -538,6 +619,9 @@ class AutomationStateTests(unittest.TestCase):
             merger.emails[1][1], "StravaMerger - Delete source activities"
         )
 
+        for filename in os.listdir(self.temporary_directory.name):
+            if filename.endswith(".gpx"):
+                os.unlink(os.path.join(self.temporary_directory.name, filename))
         merger.source_exists = False
         completed = run_automation(
             merger,
