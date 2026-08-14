@@ -30,6 +30,10 @@ GPXTPX_NAMESPACE = "http://www.garmin.com/xmlschemas/TrackPointExtension/v1"
 BOT_MARKER = "StravaMerger bot"
 
 
+class StravaRateLimitError(RuntimeError):
+    """Raised when Strava rejects a request because an API quota is exhausted."""
+
+
 @dataclass
 class UploadResult:
     """Outcome of one Strava file upload."""
@@ -112,9 +116,10 @@ class StravaMerger:
         self.refresh_token = secret["refresh_token"]
         self.mail_password = secret.get("mail")
         self.google_maps_api_key = secret.get("google_maps_api_key")
+        self.read_rate_limit: tuple[int, int] | None = None
+        self.read_rate_usage: tuple[int, int] | None = None
 
-    @staticmethod
-    def check_rate_limit(response):
+    def check_rate_limit(self, response):
         """
         Raises if the rate limit has been exceeded.
 
@@ -122,8 +127,19 @@ class StravaMerger:
             response (requests.Response): The response from the Strava API.
         """
         if isinstance(response, requests.Response):
+            self._record_rate_limits(response)
             if response.status_code == 429:
-                raise ValueError("Rate Limit Exceeded")
+                usage = (
+                    f" Read usage: {self.read_rate_usage[0]}/"
+                    f"{self.read_rate_limit[0]} per 15 minutes and "
+                    f"{self.read_rate_usage[1]}/{self.read_rate_limit[1]} per day."
+                    if self.read_rate_limit and self.read_rate_usage
+                    else ""
+                )
+                raise StravaRateLimitError(
+                    "Strava API rate limit exceeded."
+                    f"{usage} Wait for the next 15-minute reset before retrying."
+                )
             try:
                 response = response.json()
             except ValueError:
@@ -132,7 +148,35 @@ class StravaMerger:
             isinstance(response, dict)
             and response.get("message") == "Rate Limit Exceeded"
         ):
-            raise ValueError("Rate Limit Exceeded")
+            raise StravaRateLimitError("Strava API rate limit exceeded.")
+
+    def _record_rate_limits(self, response: requests.Response) -> None:
+        def values(header: str) -> tuple[int, int] | None:
+            raw = response.headers.get(header)
+            if not raw:
+                return None
+            try:
+                short_term, daily = raw.split(",", maxsplit=1)
+                return int(short_term), int(daily)
+            except (TypeError, ValueError):
+                return None
+
+        read_rate_limit = values("X-ReadRateLimit-Limit")
+        read_rate_usage = values("X-ReadRateLimit-Usage")
+        if read_rate_limit is not None:
+            self.read_rate_limit = read_rate_limit
+        if read_rate_usage is not None:
+            self.read_rate_usage = read_rate_usage
+
+    def has_read_capacity(self, requests_needed: int, *, reserve: int = 10) -> bool:
+        """Return whether Strava reports enough read quota for optional work."""
+        if not self.read_rate_limit or not self.read_rate_usage:
+            return True
+        remaining = min(
+            limit - usage
+            for limit, usage in zip(self.read_rate_limit, self.read_rate_usage)
+        )
+        return remaining >= requests_needed + reserve
 
     def get_stream_url(self, activity_id: int) -> str:
         """
@@ -229,19 +273,6 @@ class StravaMerger:
                     break
                 page += 1
 
-        for act in tqdm(activities, desc="Getting activity details"):
-            time.sleep(0.2)
-            detailed_resp = requests.get(
-                self.SINGLE_ACTIVITY_URL.format(act["id"]),
-                headers=header,
-                timeout=30,
-            )
-            self.check_rate_limit(detailed_resp)
-            detailed_resp.raise_for_status()
-            detailed_act = detailed_resp.json()
-            act.clear()
-            act.update(detailed_act)
-
         return activities[:num_activities]
 
     @staticmethod
@@ -273,7 +304,11 @@ class StravaMerger:
 
     @staticmethod
     def is_bot_activity(activity: dict[str, Any]) -> bool:
-        return BOT_MARKER.lower() in (activity.get("description") or "").lower()
+        description = (activity.get("description") or "").lower()
+        external_id = (activity.get("external_id") or "").lower()
+        return BOT_MARKER.lower() in description or external_id.startswith(
+            ("stravamerger-fix-", "stravamerger-merge-")
+        )
 
     @staticmethod
     def can_fix_activity(activity: dict[str, Any]) -> bool:

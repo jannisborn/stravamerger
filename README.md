@@ -5,104 +5,82 @@
 
 # StravaMerger
 
-StravaMerger is a Python automation for cleaning up recent Strava activities. It can:
+StravaMerger automates cleanup of recent Strava activities. It can merge contiguous
+activities, repair GPS recording holes through Google Maps, save GPX backups, upload
+replacements, and email the actions that still require manual source deletion. The
+hole repair is a headless integration of the useful parts of
+[`gpxfix`](https://github.com/jannisborn/gpxfix).
 
-- merge contiguous activities of the same sport into one replacement activity;
-- find GPS recording holes inside individual activities;
-- obtain missing route geometry from the Google Maps Routes API;
-- interpolate timestamps and elevation across the missing section;
-- back up source and replacement GPX files, upload replacements, and optionally email links;
-- resume duplicate-rejected uploads after the original activity is manually deleted.
+## Behavior
 
-The hole-repair feature is a headless integration of the useful parts of the older
-[`gpxfix`](https://github.com/jannisborn/gpxfix) project. Its Tk GUI and manual GPX
-fragment workflow are not used.
+Merge candidates must have the same sport, nearby endpoints, and normally the same
+local date. `--require-same-gear` additionally requires the same non-empty `gear_id`.
 
-## How it works
+With `--fix-holes`, an unchecked track has a hole when adjacent points exceed both:
 
-Each run retrieves the requested number of recent activities. Merge candidates are
-selected when their sport matches and their endpoints are sufficiently close. By
-default, they must start on the same local day; the existing overnight-continuation
-behavior is retained.
+- `--hole-time-threshold` (default: 5 seconds), and
+- `--hole-distance-threshold` (default: 400 m straight-line).
 
-When `--fix-holes` is supplied, every eligible, unprocessed GPS track is also
-inspected for adjacent points where:
+Google Routes supplies the missing geometry. StravaMerger interpolates timestamps and
+elevation while retaining existing points and their heart-rate and temperature data.
+Hole endpoints are reverse geocoded for logs and email; coordinates are used if
+geocoding fails.
 
-- the timestamp jump is greater than `--hole-time-threshold` (default: 5 seconds), and
-- the straight-line jump is greater than `--hole-distance-threshold` (default: 400 m).
+Travel mode comes from the Strava sport: cycle sports use `BICYCLE`; runs, walks, and
+hikes use `WALK`; unsupported sports require manual review. Internal limits reject
+more than five holes, a direct gap over 20 km, or a route over four times the direct
+distance.
 
-For each hole, StravaMerger asks the Google Routes API for a high-quality route between
-the surviving endpoints. It inserts the returned geometry into the original time
-window and linearly interpolates elevation. Existing points and their heart-rate and
-temperature extensions are retained.
+Repaired tracks keep their name unless it starts with `Fahrt am ...` or `Lauf am ...`.
+For those generic names, a matching location in `NAME_DICT` supplies a route name such
+as `IBM`.
 
-The two endpoints are reverse geocoded for console and deletion-email reporting, for
-example `1.35 km between Startstrasse 1, Zürich and Zielweg 2, Zürich`. Address lookup
-is best-effort: if Google returns no address or the Geocoding API is unavailable,
-StravaMerger reports endpoint coordinates and continues repairing the track.
+## Fetching and persistent state
 
-Repaired activities keep their existing name unless it is a generic `Fahrt am ...` or
-`Lauf am ...` name. Generic names are replaced when the track passes a location in
-`NAME_DICT` (for example, `IBM`); otherwise the generic name is retained.
+`--n_activities` controls the recent activity window, not the number fully downloaded:
 
-The automatic travel modes are intentionally conservative:
+1. StravaMerger lists summary data for the window.
+2. It fetches full details for pending jobs and summary-based merge candidates.
+3. For hole detection, it fetches the description of each previously unchecked
+   activity and, unless `nomerge` or `nofix` is present, fetches its GPS stream.
+4. Only the GPS stream can reveal whether a hole exists; summary statistics cannot.
 
-| Strava sport | Google mode |
-| --- | --- |
-| Ride, MountainBikeRide, GravelRide, EBikeRide and related cycle sports | `BICYCLE` |
-| Run, TrailRun, Walk, Hike, Wheelchair | `WALK` |
-| Other sports | manual review; no route is invented |
+The program monitors
+[Strava's read-limit headers](https://developers.strava.com/docs/rate-limits/), keeps
+ten requests in reserve, and stops starting new checks when that reserve is reached.
+Completed checks are recorded in `<ofolder>/.stravamerger-state.json`. On the next
+scheduled run they are skipped, so an initial window such as 200 activities is scanned
+across multiple runs rather than all at once.
 
-Travel mode is always derived from the activity's Strava sport and cannot be
-overridden. Internal safety limits reject a direct gap over 20 km, a routed distance
-over four times the direct distance, or an activity with more than five holes. A
-rejected or unsupported repair is left unchanged, recorded in the state file, and
-reported by email when enabled.
+There is currently no `--force-refresh` flag. To perform a complete rescan, first
+resolve all pending replacements, then delete the state file. Do not delete it while
+jobs are pending: it also contains saved upload and notification state.
 
-## Strava replacement lifecycle
+## Replacement workflow and email
 
-Strava does not expose an API operation for deleting activities. A replacement may
-also be rejected while its source activity exists because Strava detects it as a
-duplicate. StravaMerger therefore uses this workflow:
+Strava does not allow API deletion of activities. StravaMerger therefore:
 
-1. Save source GPX backups and the replacement GPX in `--ofolder`.
-2. Record a durable job in `<ofolder>/.stravamerger-state.json`.
-3. On every run, email the current list of source activities that still need action,
-   including detected GPS hole distances and addresses, when email is enabled.
-4. Attempt the replacement upload.
-5. If Strava reports a duplicate, wait for source deletion and retry the saved file on
-   a later run.
-6. Email the new Strava link after a successful upload, when email is enabled.
+1. saves source and replacement GPX files in `--ofolder`;
+2. attempts the replacement upload and records the job;
+3. emails the current source-deletion checklist on every run while action remains;
+4. retries duplicate-rejected uploads after the source disappears and sends one
+   confirmation email after a successful upload.
 
-Deletion reminders are deliberately sent again on every run while at least one source
-activity still exists. This makes each email a current checklist: deleted sources drop
-out, while unresolved sources remain. Upload-confirmation emails are sent once after
-SMTP succeeds; a skipped confirmation is retried on a later run.
+Deleted sources disappear from the next reminder. Add these case-insensitive markers
+to a Strava activity description:
 
-Do not delete the state file while jobs are pending. It keeps replacement and
-notification state consistent and prevents repeated repair generation and Google
-routing calls. Activities already checked and found clean are also recorded there.
-Delete the state file only when you intentionally want a full rescan.
+- `nomerge`: skip merging and hole repair, and cancel a pending replacement;
+- `nofix`: skip hole repair.
 
-Replacing an activity does not preserve its kudos, comments, photos, existing segment
-results, or original device attribution. The original GPX backup remains in the output
-folder.
+Activities created by StravaMerger are excluded automatically.
 
-## Installation
+## Setup
 
 ```console
 uv sync
 ```
 
-This creates a local `.venv` and installs the project dependencies.
-
-## API setup
-
-### Strava
-
-Create a [Strava API application](https://www.strava.com/settings/api) and authorize it
-with `activity:read`, `activity:read_all`, and `activity:write`. Create a writable
-`secret.json` file:
+Create a writable `secret.json`:
 
 ```json
 {
@@ -111,116 +89,44 @@ with `activity:read`, `activity:read_all`, and `activity:write`. Create a writab
   "access_token": "STRAVA_ACCESS_TOKEN",
   "refresh_token": "STRAVA_REFRESH_TOKEN",
   "mail": "GMAIL_APP_PASSWORD",
-  "google_maps_api_key": "YOUR_GOOGLE_MAPS_API_KEY"
+  "google_maps_api_key": "GOOGLE_MAPS_API_KEY"
 }
 ```
 
-Strava can rotate the refresh token. StravaMerger writes the latest access token,
-refresh token, and expiration back to this file atomically, so the file must remain
-writable. Keep it out of version control; `*secret.json` is ignored by this repository.
+The Strava application needs `activity:read`, `activity:read_all`, and
+`activity:write`. StravaMerger persists rotated tokens back to this file.
 
-### Google Maps
+For hole repair, enable billing plus the Google Maps Routes and Geocoding APIs and
+restrict the key to those APIs and, when possible, the server IP. Google usage is
+billable: each hole needs one route request and up to two reverse-geocoding requests.
 
-Enable billing, the
-[Google Maps Routes API](https://developers.google.com/maps/documentation/routes), and
-the [Geocoding API](https://developers.google.com/maps/documentation/geocoding/guides-v3/requests-reverse-geocoding)
-for the API key's Google Cloud project. Restrict the key to those two APIs and, where
-your deployment permits it, to the server's source IP.
-
-Store the key as `google_maps_api_key` in `secret.json`, as shown above.
-
-Google Maps Platform usage is billable and governed by Google's current terms. In
-particular, review the applicable restrictions before storing routed geometry or using
-it outside a Google map. Hole filling is disabled by default; use `--fix-holes` to opt
-in after configuring Google. The merge automation continues to work without it.
-Each hole requires one route request and up to two separately billable reverse-geocoding
-requests. Hole endpoint coordinates are sent to Google for both operations. Repeated
-coordinates are looked up only once during a run.
-
-### Email
-
-The current notifier uses Gmail SMTP. `mail` must therefore be an app password for the
-address passed to `--sender`, not the account's normal password. Email is disabled by
-default; add `--sender your-address@gmail.com` to enable deletion, confirmation, and
-review messages. Without email, source IDs remain available in the state file and logs.
+Email uses Gmail SMTP. `mail` must be an app password for the address passed to
+`--sender`. Omit `--sender` to disable email.
 
 ## Usage
 
-Run both merge and hole-repair automation:
-
 ```console
 uv run stravamerger \
   --credentials secret.json \
-  --n_activities 21 \
-  --distance 500 \
-  --ofolder data/ \
+  --n_activities 200 \
+  --distance 800 \
+  --ofolder tracks/ \
   --recipient name@example.com \
   --sender your-address@gmail.com \
+  --require-same-gear \
   --fix-holes
 ```
 
-Only merge activities:
+Hole repair defaults to off; omit `--fix-holes` for merge-only operation. Use the same
+`--ofolder` or explicit `--state` path on every cron run so queued jobs and scan
+progress resume. Use absolute paths in cron. Run `uv run stravamerger --help` for all
+options.
 
-```console
-uv run stravamerger \
-  --credentials secret.json \
-  --n_activities 21 \
-  --distance 500 \
-  --ofolder data/ \
-  --recipient name@example.com \
-  --sender your-address@gmail.com
-```
+Replacing an activity does not preserve kudos, comments, photos, existing segment
+results, or original device attribution. Source GPX backups remain in the output
+folder.
 
-Require the same bike or shoes across merge candidates:
-
-```console
-uv run stravamerger \
-  --credentials secret.json \
-  --n_activities 21 \
-  --distance 500 \
-  --ofolder data/ \
-  --recipient name@example.com \
-  --sender your-address@gmail.com \
-  --require-same-gear
-```
-
-Useful repair options:
-
-```text
---fix-holes / --no-fix-holes  (default: no-fix-holes)
---hole-time-threshold FLOAT
---hole-distance-threshold FLOAT
---state PATH
-```
-
-Run `uv run stravamerger --help` for the complete current CLI reference.
-
-## Scheduling
-
-The command remains a one-shot process, making it suitable for cron, a systemd timer,
-launchd, or another scheduler. For example, this checks the latest activities every
-hour:
-
-```cron
-15 * * * * cd /absolute/path/to/stravamerger && /absolute/path/to/uv run stravamerger --credentials /absolute/path/to/secret.json --n_activities 21 --distance 500 --ofolder /absolute/path/to/data --recipient name@example.com --sender your-address@gmail.com --fix-holes
-```
-
-Use absolute paths in scheduled jobs. Keep the same `--ofolder` or explicit `--state`
-path between runs so pending uploads can resume. Because hole filling defaults to off,
-the scheduled command must include `--fix-holes` if it should discover new broken
-tracks. Already queued jobs still resume and generate reminders without that flag.
-
-## Per-activity controls
-
-Add these case-insensitive markers to a Strava activity description:
-
-- `nomerge`: exclude the activity from both merge matching and GPS-hole repair, and
-  cancel a queued replacement on the next run;
-- `nofix`: exclude the activity from GPS-hole repair.
-
-Activities created by StravaMerger are automatically excluded from both operations.
-
-## Development checks
+## Development
 
 ```console
 uv run python -m unittest discover -s tests -v

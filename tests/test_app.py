@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import gpxpy.gpx
+import requests
 
 from app import StravaMerger
 from utils import Activity, CustomGPX
@@ -110,6 +111,30 @@ class StravaApiTests(unittest.TestCase):
         merged = self.merger.merge_gpx([gpx])
         gpxpy.parse(merged.to_xml())
 
+    def test_activity_list_does_not_fetch_every_activity_individually(self):
+        activities = [
+            {"id": 1, "name": "One"},
+            {"id": 2, "name": "Two"},
+        ]
+        with patch("app.requests.get", return_value=FakeResponse(activities)) as request:
+            result = self.merger.get_activities(2)
+
+        self.assertEqual(result, activities)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[0], self.merger.ACTIVITIES_URL)
+
+    def test_reported_read_quota_is_reserved_for_essential_requests(self):
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b"{}"
+        response.headers["X-ReadRateLimit-Limit"] = "100,1000"
+        response.headers["X-ReadRateLimit-Usage"] = "89,500"
+
+        self.merger.check_rate_limit(response)
+
+        self.assertTrue(self.merger.has_read_capacity(1, reserve=10))
+        self.assertFalse(self.merger.has_read_capacity(2, reserve=10))
+
     def test_synchronous_duplicate_upload_is_returned_without_retry_loop(self):
         filepath = os.path.join(self.temporary_directory.name, "replacement.gpx")
         gpx = CustomGPX()
@@ -189,6 +214,14 @@ class StravaApiTests(unittest.TestCase):
         }
 
         self.assertFalse(StravaMerger.can_fix_activity(activity))
+
+    def test_bot_activity_is_recognized_from_summary_external_id(self):
+        activity = {
+            "description": None,
+            "external_id": "stravamerger-fix-123-v1",
+        }
+
+        self.assertTrue(StravaMerger.is_bot_activity(activity))
 
 
 if __name__ == "__main__":

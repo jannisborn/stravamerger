@@ -3,7 +3,7 @@ import os
 import typer
 from loguru import logger
 
-from app import StravaMerger
+from app import StravaMerger, StravaRateLimitError
 from automation import run_automation
 
 app = typer.Typer(no_args_is_help=True)
@@ -29,23 +29,29 @@ def run(
         dist_theta=distance,
         require_same_gear=require_same_gear,
     )
-    merger.refresh_access_token()
+    try:
+        merger.refresh_access_token()
 
-    # Fetch activities
-    activities = merger.get_activities(n_activities)
-    logger.info(f"Fetched {len(activities)} activities.")
+        # Fetch activities
+        activities = merger.get_activities(n_activities)
+        logger.info(f"Fetched {len(activities)} activities.")
 
-    state_path = state_path or os.path.join(output_folder, ".stravamerger-state.json")
-    summary = run_automation(
-        merger,
-        activities=activities,
-        output_folder=output_folder,
-        recipient=recipient,
-        state_path=state_path,
-        fix_holes=fix_holes,
-        hole_time_threshold=hole_time_threshold,
-        hole_distance_threshold=hole_distance_threshold,
-    )
+        state_path = state_path or os.path.join(
+            output_folder, ".stravamerger-state.json"
+        )
+        summary = run_automation(
+            merger,
+            activities=activities,
+            output_folder=output_folder,
+            recipient=recipient,
+            state_path=state_path,
+            fix_holes=fix_holes,
+            hole_time_threshold=hole_time_threshold,
+            hole_distance_threshold=hole_distance_threshold,
+        )
+    except StravaRateLimitError as error:
+        logger.error("{}", error)
+        return
     logger.info(
         "Finished: {} merge replacement(s), {} repaired activity replacement(s), "
         "{} repaired hole(s), {} upload(s), {} deferred job(s).",

@@ -30,6 +30,7 @@ from gpxfixer import (
 from utils import Activity, CustomGPX
 
 MAX_HOLES_PER_ACTIVITY = 5
+READ_REQUEST_RESERVE = 10
 
 
 @dataclass
@@ -188,6 +189,17 @@ def run_automation(
     geocoding_client = None
     address_cache: dict[tuple[float, float], str] = {}
     gpx_cache: dict[int, CustomGPX] = {}
+    scan_budget_exhausted = False
+
+    def defer_remaining_scans() -> None:
+        nonlocal scan_budget_exhausted
+        if not scan_budget_exhausted:
+            logger.warning(
+                "Keeping {} Strava read requests in reserve; remaining new activities "
+                "will be checked on a later run.",
+                READ_REQUEST_RESERVE,
+            )
+        scan_budget_exhausted = True
 
     def fetch(activity: Activity) -> CustomGPX:
         if activity.id not in gpx_cache:
@@ -276,6 +288,37 @@ def run_automation(
 
     new_job_ids = []
     for chain in merge_chains:
+        requests_needed = len(chain) + sum(
+            _activity_detail_request_needed(
+                merger,
+                activity.id,
+                activities_by_id,
+            )
+            for activity in chain
+        )
+        if not _has_read_capacity(merger, requests_needed):
+            defer_remaining_scans()
+            break
+        detailed_activities = [
+            _get_detailed_activity(
+                merger,
+                activity.id,
+                activities_by_id,
+                source_exists_cache,
+            )
+            for activity in chain
+        ]
+        if any(activity is None for activity in detailed_activities):
+            continue
+        if any(
+            "nomerge" in (activity.get("description") or "").lower()
+            or StravaMerger.is_bot_activity(activity)
+            for activity in detailed_activities
+        ):
+            continue
+        chain = [
+            merger.activity_from_api(activity) for activity in detailed_activities
+        ]
         if any(
             store.review_reason(activity.id)
             and "nofix" not in activity.description.lower()
@@ -323,13 +366,34 @@ def run_automation(
         summary.merged_jobs += 1
         summary.repaired_holes += repaired_count
 
-    for api_activity in available if fix_holes else []:
+    for api_activity in available if fix_holes and not scan_budget_exhausted else []:
         if (
             api_activity["id"] in merged_source_ids
-            or not merger.can_fix_activity(api_activity)
+            or not api_activity.get("start_latlng")
+            or StravaMerger.is_bot_activity(api_activity)
+            or (
+                "description" in api_activity
+                and not merger.can_fix_activity(api_activity)
+            )
             or store.was_checked_clean(api_activity["id"])
             or store.review_reason(api_activity["id"])
         ):
+            continue
+        requests_needed = 1 + _activity_detail_request_needed(
+            merger,
+            api_activity["id"],
+            activities_by_id,
+        )
+        if not _has_read_capacity(merger, requests_needed):
+            defer_remaining_scans()
+            break
+        api_activity = _get_detailed_activity(
+            merger,
+            api_activity["id"],
+            activities_by_id,
+            source_exists_cache,
+        )
+        if api_activity is None or not merger.can_fix_activity(api_activity):
             continue
         source = merger.activity_from_api(api_activity)
         original = fetch(source)
@@ -479,8 +543,49 @@ def _source_exists(
     cache: dict[int, bool],
 ) -> bool:
     if source_id not in cache:
+        if not _has_read_capacity(merger, 1):
+            return True
         cache[source_id] = merger.activity_exists(source_id)
     return cache[source_id]
+
+
+def _has_read_capacity(merger: StravaMerger, requests_needed: int) -> bool:
+    has_capacity = getattr(merger, "has_read_capacity", None)
+    if not callable(has_capacity):
+        return True
+    return has_capacity(requests_needed, reserve=READ_REQUEST_RESERVE)
+
+
+def _activity_detail_request_needed(
+    merger: StravaMerger,
+    activity_id: int,
+    activities_by_id: dict[int, dict[str, Any]],
+) -> int:
+    activity = activities_by_id.get(activity_id)
+    if activity is not None and "description" in activity:
+        return 0
+    return int(callable(getattr(merger, "get_activity", None)))
+
+
+def _get_detailed_activity(
+    merger: StravaMerger,
+    activity_id: int,
+    activities_by_id: dict[int, dict[str, Any]],
+    source_exists_cache: dict[int, bool],
+) -> dict[str, Any] | None:
+    activity = activities_by_id.get(activity_id)
+    if activity is not None and "description" in activity:
+        return activity
+    get_activity = getattr(merger, "get_activity", None)
+    if not callable(get_activity):
+        return activity
+    activity = get_activity(activity_id)
+    source_exists_cache[activity_id] = activity is not None
+    if activity is None:
+        activities_by_id.pop(activity_id, None)
+    else:
+        activities_by_id[activity_id] = activity
+    return activity
 
 
 def _refresh_pending_source_activities(
@@ -497,12 +602,21 @@ def _refresh_pending_source_activities(
         if job["status"] not in {"awaiting_deletion", "ready", "uploaded"}:
             continue
         for source_id in job["source_ids"]:
-            if source_id in source_exists_cache:
+            activity = activities_by_id.get(source_id)
+            if activity is not None and "description" in activity:
                 continue
-            activity = get_activity(source_id)
-            source_exists_cache[source_id] = activity is not None
-            if activity is not None:
-                activities_by_id[source_id] = activity
+            if not _has_read_capacity(merger, 1):
+                logger.warning(
+                    "Could not refresh all pending Strava activities without using the "
+                    "reserved read quota."
+                )
+                return
+            _get_detailed_activity(
+                merger,
+                source_id,
+                activities_by_id,
+                source_exists_cache,
+            )
 
 
 def _notify_outstanding_deletions(
