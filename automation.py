@@ -197,7 +197,7 @@ def run_automation(
     )
     # Pending-action email is intentionally sent before the potentially expensive
     # historical scan, so a later process failure cannot suppress the daily reminder.
-    _notify_outstanding_deletions(
+    deletion_reminder_attempted = _notify_outstanding_deletions(
         merger,
         store,
         recipient,
@@ -491,13 +491,14 @@ def run_automation(
 
     if new_job_ids:
         _upload_jobs(merger, store, new_job_ids, recipient, summary)
-        _notify_outstanding_deletions(
-            merger,
-            store,
-            recipient,
-            activities_by_id=activities_by_id,
-            source_exists_cache=source_exists_cache,
-        )
+        if not deletion_reminder_attempted:
+            _notify_outstanding_deletions(
+                merger,
+                store,
+                recipient,
+                activities_by_id=activities_by_id,
+                source_exists_cache=source_exists_cache,
+            )
 
     if summary.review_messages:
         merger.send_email(
@@ -742,8 +743,8 @@ def _notify_outstanding_deletions(
     *,
     activities_by_id: dict[int, dict[str, Any]],
     source_exists_cache: dict[int, bool],
-) -> None:
-    """Send the current outstanding-source list on every scheduled run."""
+) -> bool:
+    """Send at most one current outstanding-source list per automation run."""
     job_ids = []
     existing_source_ids = set()
     for job_id, job in store.jobs.items():
@@ -767,6 +768,8 @@ def _notify_outstanding_deletions(
             job_ids,
             existing_source_ids=existing_source_ids,
         )
+        return True
+    return False
 
 
 def _notify_deletions(
