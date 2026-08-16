@@ -434,7 +434,7 @@ class StravaMerger:
                 gear_matches = same_gear or not self.require_same_gear
 
                 if same_day and same_type and gear_matches and dist < self.dist_theta:
-                    logger.info(
+                    logger.trace(
                         f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
                         + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
                     )

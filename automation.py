@@ -89,15 +89,21 @@ class JobStore:
         self.data.setdefault("checks", {})
         self.data.setdefault("reviews", {})
         self.data.setdefault("name_reminders", {})
-        self.data.setdefault(
+        scan = self.data.setdefault(
             "scan",
             {
                 "initialized": False,
                 "pending": {},
                 "screened_ids": [],
+                "excluded_ids": [],
                 "last_screened_start_date": None,
             },
         )
+        scan.setdefault("initialized", False)
+        scan.setdefault("pending", {})
+        scan.setdefault("screened_ids", [])
+        scan.setdefault("excluded_ids", [])
+        scan.setdefault("last_screened_start_date", None)
 
     @property
     def jobs(self) -> dict[str, dict[str, Any]]:
@@ -121,11 +127,23 @@ class JobStore:
         review = self.data["reviews"].get(str(activity_id))
         return review["reason"] if review else None
 
-    def mark_for_review(self, activity_id: int, reason: str) -> None:
-        self.data["reviews"][str(activity_id)] = {
+    def mark_for_review(
+        self,
+        activity_id: int,
+        reason: str,
+        *,
+        name: str | None = None,
+        hole_details: list[dict[str, Any]] | None = None,
+    ) -> None:
+        review = {
             "reason": reason,
             "reviewed_at": _now(),
         }
+        if name:
+            review["name"] = name
+        if hole_details:
+            review["hole_details"] = hole_details
+        self.data["reviews"][str(activity_id)] = review
         self.save()
 
     def clear_review(self, activity_id: int) -> None:
@@ -145,30 +163,43 @@ class JobStore:
         """Refresh the compact oldest-first catalog and add unseen summaries."""
         scan = self.data["scan"]
         screened = {int(activity_id) for activity_id in scan["screened_ids"]}
+        excluded = {int(activity_id) for activity_id in scan["excluded_ids"]}
         pending = scan["pending"]
         added = 0
         for activity in activities:
             activity_id = int(activity["id"])
             key = str(activity_id)
-            if activity_id in screened:
-                continue
+            previously_known = (
+                activity_id in screened
+                or activity_id in excluded
+                or key in pending
+            )
             if StravaMerger.is_bot_activity(activity):
                 pending.pop(key, None)
-                screened.add(activity_id)
+                screened.discard(activity_id)
+                excluded.add(activity_id)
                 continue
-            is_new = key not in pending
+            review = self.data["reviews"].get(key)
+            if review and not review.get("hole_details"):
+                # Older state files kept only the review message. Requeue the
+                # activity once so the daily report can gain structured endpoints.
+                screened.discard(activity_id)
+            if activity_id in screened or activity_id in excluded:
+                continue
             pending[key] = {
                 field: activity.get(field)
                 for field in CATALOG_KEYS
                 if field in activity
             }
-            added += int(is_new)
+            added += int(not previously_known)
         scan["screened_ids"] = sorted(screened)
+        scan["excluded_ids"] = sorted(excluded)
         if initialize:
             scan["initialized"] = True
             scan["initialized_at"] = _now()
         scan["pending_count"] = len(pending)
         scan["screened_count"] = len(screened)
+        scan["excluded_count"] = len(excluded)
         scan["updated_at"] = _now()
         self.save()
         return added
@@ -212,6 +243,7 @@ class JobStore:
                 [date for date in (previous, *dates) if date]
             )
         scan["screened_count"] = len(screened)
+        scan["excluded_count"] = len(scan["excluded_ids"])
         scan["pending_count"] = len(scan["pending"])
         scan["updated_at"] = _now()
         self.save()
@@ -340,7 +372,10 @@ def prepare_oldest_activity_batch(
     if not store.scan_initialized:
         added = store.sync_catalog(catalog, initialize=True)
         logger.info(
-            "Initialized oldest-first scan catalog with {} activities.", added
+            "Initialized oldest-first scan catalog with {} source activities; "
+            "{} StravaMerger replacements excluded.",
+            added,
+            store.data["scan"].get("excluded_count", 0),
         )
     else:
         added = store.sync_catalog(catalog)
@@ -455,6 +490,11 @@ def run_automation(
         for chain in merge_chains
         if any(activity.id in scan_activity_ids for activity in chain)
     ]
+    for chain in merge_chains:
+        logger.info(
+            "Selected merge chain: {}.",
+            " → ".join(f'"{activity.name}"' for activity in chain),
+        )
     merge_chains.sort(
         key=lambda chain: not any(
             activity.id in rebuild_source_ids for activity in chain
@@ -488,14 +528,26 @@ def run_automation(
             marker in activity.description.lower() for marker in ("nofix", "nomerge")
         ):
             return gpx, []
-        previous_review = store.review_reason(activity.id)
+        previous_review_entry = store.data["reviews"].get(str(activity.id))
+        previous_review = (
+            previous_review_entry["reason"] if previous_review_entry else None
+        )
         if previous_review:
-            if not _review_can_use_straight_line(previous_review):
+            if (
+                previous_review_entry.get("hole_details")
+                and not _review_can_use_straight_line(previous_review)
+            ):
                 return None, []
-            logger.info(
-                'Retrying "{}" because straight-line fallback is now available.',
-                activity.name,
-            )
+            if _review_can_use_straight_line(previous_review):
+                logger.info(
+                    'Retrying "{}" because straight-line fallback is now available.',
+                    activity.name,
+                )
+            else:
+                logger.info(
+                    'Rechecking "{}" to enrich its legacy review with hole details.',
+                    activity.name,
+                )
             store.clear_review(activity.id)
         holes = detect_holes(
             gpx,
@@ -513,21 +565,32 @@ def run_automation(
         hole_details = [
             _describe_hole(hole, geocoding_client, address_cache) for hole in holes
         ]
-        for detail in hole_details:
-            logger.info(
-                'Detected GPS hole in "{}": {} between {} and {}.',
-                activity.name,
-                _format_distance(detail["distance_meters"]),
-                detail["origin_address"],
-                detail["destination_address"],
-            )
+        hole_label = "GPS hole" if len(hole_details) == 1 else "GPS holes"
+        hole_lines = "\n".join(
+            "  - "
+            f"{_format_distance(detail['distance_meters'])}: "
+            f"{detail['origin_address']} → {detail['destination_address']}"
+            for detail in hole_details
+        )
+        logger.info(
+            'Detected {} {} in "{}":\n{}',
+            len(hole_details),
+            hole_label,
+            activity.name,
+            hole_lines,
+        )
         if len(holes) > MAX_HOLES_PER_ACTIVITY:
             message = (
                 f"Activity {activity.id} ({activity.name}) has {len(holes)} holes, "
                 f"exceeding the automatic limit of {MAX_HOLES_PER_ACTIVITY}."
             )
             summary.review_messages.append(message)
-            store.mark_for_review(activity.id, message)
+            store.mark_for_review(
+                activity.id,
+                message,
+                name=activity.name,
+                hole_details=hole_details,
+            )
             return None, []
 
         mode = travel_mode_for_sport(activity.sport)
@@ -537,7 +600,12 @@ def run_automation(
                 f"but sport type {activity.sport!r} has no safe automatic Google route mode."
             )
             summary.review_messages.append(message)
-            store.mark_for_review(activity.id, message)
+            store.mark_for_review(
+                activity.id,
+                message,
+                name=activity.name,
+                hole_details=hole_details,
+            )
             return None, []
         for detail in hole_details:
             detail["travel_mode"] = mode
@@ -585,7 +653,12 @@ def run_automation(
                 f"Activity {activity.id} ({activity.name}) was not repaired: {error}"
             )
             summary.review_messages.append(message)
-            store.mark_for_review(activity.id, message)
+            store.mark_for_review(
+                activity.id,
+                message,
+                name=activity.name,
+                hole_details=hole_details,
+            )
             return None, []
         return repair_holes(gpx, repairs), hole_details
 
@@ -1170,9 +1243,21 @@ def _send_daily_report(
         if job["status"] in {"uploaded", "complete"}
         and job.get("confirmation_notification_recipient") != recipient
     ]
-    review_messages = list(summary.review_messages)
+    review_items = [
+        {"id": int(activity_id), **review}
+        for activity_id, review in store.data["reviews"].items()
+        if review.get("hole_details")
+    ]
+    structured_reasons = {review["reason"] for review in review_items}
+    review_messages = [
+        message
+        for message in summary.review_messages
+        if message not in structured_reasons
+    ]
     review_messages.extend(
-        review["reason"] for review in store.data["reviews"].values()
+        review["reason"]
+        for review in store.data["reviews"].values()
+        if not review.get("hole_details")
     )
     review_messages.extend(
         f'Replacement "{job["replacement"].get("name", job["id"])}" requires '
@@ -1206,6 +1291,7 @@ def _send_daily_report(
             deletion_jobs,
             confirmation_jobs,
             review_messages,
+            review_items,
             name_reminders,
             summary.info_messages,
         )
@@ -1219,6 +1305,7 @@ def _send_daily_report(
             existing_source_ids=existing_source_ids,
             confirmation_jobs=confirmation_jobs,
             review_messages=review_messages,
+            review_items=review_items,
             name_reminders=name_reminders,
             info_messages=summary.info_messages,
         ),
@@ -1489,8 +1576,10 @@ def _review_can_use_straight_line(reason: str) -> bool:
 
 
 def _review_blocks_retry(store: JobStore, activity_id: int) -> bool:
-    reason = store.review_reason(activity_id)
-    return bool(reason and not _review_can_use_straight_line(reason))
+    review = store.data["reviews"].get(str(activity_id))
+    if not review or not review.get("hole_details"):
+        return False
+    return not _review_can_use_straight_line(review["reason"])
 
 
 def _delete_mail_body(
@@ -1530,27 +1619,36 @@ def _delete_mail_items(
             hole_details = details_by_source.get(str(source["id"]), [])
             distances_by_source = job.get("hole_distances_meters", {})
             distances = distances_by_source.get(str(source["id"]), [])
-            if hole_details:
-                label = "GPS hole" if len(hole_details) == 1 else "GPS holes"
-                detail_text = "; ".join(
-                    _format_hole_detail(detail) for detail in hole_details
-                )
-                details = f"{label}: {detail_text}"
-            elif distances:
-                label = "GPS hole" if len(distances) == 1 else "GPS holes"
-                distance_text = ", ".join(
-                    _format_distance(distance) for distance in distances
-                )
-                details = f"{label}: {distance_text} straight-line"
-            elif job["kind"] == "fix":
-                details = "GPS hole repair; distance unavailable"
-            else:
-                details = "no GPS hole; merge replacement"
             body.append(
                 f"<li>{escape(source['name'])} &mdash; "
-                f"<a href='{url}'>Strava activity {source['id']}</a> "
-                f"({escape(details)})</li>"
+                f"<a href='{url}'>Strava activity {source['id']}</a>"
             )
+            if hole_details:
+                label = "GPS hole" if len(hole_details) == 1 else "GPS holes"
+                body.append(
+                    f"<div>{len(hole_details)} {label} found:</div><ul>"
+                )
+                body.extend(
+                    f"<li>{_format_hole_detail_html(detail)}</li>"
+                    for detail in hole_details
+                )
+                body.append("</ul>")
+            elif distances:
+                label = "GPS hole" if len(distances) == 1 else "GPS holes"
+                body.append(
+                    f"<div>{len(distances)} {label} found:</div><ul>"
+                )
+                body.extend(
+                    f"<li><strong>{escape(_format_distance(distance))}</strong> "
+                    "(straight-line; endpoints unavailable)</li>"
+                    for distance in distances
+                )
+                body.append("</ul>")
+            elif job["kind"] == "fix":
+                body.append("<div>GPS hole repair; details unavailable.</div>")
+            else:
+                body.append("<div>Merge replacement; no GPS holes.</div>")
+            body.append("</li>")
     return "".join(body)
 
 
@@ -1580,7 +1678,9 @@ def _daily_mail_body(
     review_messages: list[str],
     name_reminders: list[dict[str, Any]],
     info_messages: list[str],
+    review_items: list[dict[str, Any]] | None = None,
 ) -> str:
+    review_items = review_items or []
     body = ["<html><body><h1>StravaMerger daily report</h1>"]
     if confirmation_jobs:
         body.append("<h2>Uploaded replacements</h2><ul>")
@@ -1622,8 +1722,20 @@ def _daily_mail_body(
         body.append("<h2>Completed metadata updates</h2><ul>")
         body.extend(f"<li>{escape(message)}</li>" for message in info_messages)
         body.append("</ul>")
-    if review_messages:
+    if review_messages or review_items:
         body.append("<h2>Needs review</h2><ul>")
+        for review in review_items:
+            hole_details = review["hole_details"]
+            label = "GPS hole" if len(hole_details) == 1 else "GPS holes"
+            body.append(
+                f"<li>{_link_activity_ids(review['reason'])}"
+                f"<div>{len(hole_details)} {label} found:</div><ul>"
+            )
+            body.extend(
+                f"<li>{_format_hole_detail_html(detail)}</li>"
+                for detail in hole_details
+            )
+            body.append("</ul></li>")
         body.extend(
             f"<li>{_link_activity_ids(message)}</li>" for message in review_messages
         )
@@ -1686,6 +1798,20 @@ def _format_hole_detail(detail: dict[str, Any]) -> str:
         text += ". Straight-line GPX coordinates were used"
         if detail.get("fallback_reason"):
             text += f" because {detail['fallback_reason']}"
+    return text
+
+
+def _format_hole_detail_html(detail: dict[str, Any]) -> str:
+    text = (
+        f"<strong>{escape(_format_distance(detail['distance_meters']))}</strong>: "
+        f"{escape(detail['origin_address'])} &rarr; "
+        f"{escape(detail['destination_address'])}"
+    )
+    if detail.get("repair_method") == "straight_line":
+        text += "<br><em>Straight-line GPX coordinates were used"
+        if detail.get("fallback_reason"):
+            text += f" because {escape(detail['fallback_reason'])}"
+        text += ".</em>"
     return text
 
 

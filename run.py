@@ -58,13 +58,23 @@ def run(
             generic_names=generic_names,
         )
         store = JobStore(state_path)
-        store.record_screened(
-            summary.screened_activity_ids | store.claimed_source_ids()
-        )
+        previously_screened = {
+            int(activity_id)
+            for activity_id in store.data["scan"]["screened_ids"]
+        }
+        recorded_ids = summary.screened_activity_ids | store.claimed_source_ids()
+        store.record_screened(recorded_ids)
         scan = store.data["scan"]
+        screened_this_run = len(
+            set(scan["screened_ids"]) - previously_screened
+        )
         logger.info(
-            "History progress: {} screened, {} pending; latest screened start {}.",
+            "History progress: {} source activities screened total (+{} this run), "
+            "{} StravaMerger replacements excluded, {} pending; latest screened "
+            "start {}.",
             scan.get("screened_count", 0),
+            screened_this_run,
+            scan.get("excluded_count", 0),
             scan.get("pending_count", 0),
             scan.get("last_screened_start_date") or "none",
         )

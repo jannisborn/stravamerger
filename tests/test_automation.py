@@ -92,7 +92,10 @@ class AutomationStateTests(unittest.TestCase):
             self.assertEqual(json.load(file)["version"], 1)
         email_body = _delete_mail_body([loaded_store.jobs["fix-123"]])
         self.assertIn("Ride", email_body)
+        self.assertIn("1 GPS hole found", email_body)
         self.assertIn("1.50 km", email_body)
+        self.assertIn("Start Street &rarr; End Street", email_body)
+        self.assertIn("<ul><li><strong>1.50 km</strong>", email_body)
         self.assertIn("Straight-line GPX coordinates were used", email_body)
         self.assertIn("Google Routes returned no route", email_body)
         self.assertIn(
@@ -145,6 +148,27 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(merger.full_calls, 2)
         self.assertLess(os.path.getsize(state_path), 2_000)
 
+    def test_bot_replacements_are_excluded_from_screened_count(self):
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        store = JobStore(state_path)
+        store.data["scan"]["screened_ids"] = [99]
+        store.save()
+        bot = {
+            "id": 99,
+            "name": "Uploaded replacement",
+            "external_id": "stravamerger-fix-10-v1",
+            "start_date": "2020-01-01T08:00:00Z",
+            "start_date_local": "2020-01-01T09:00:00Z",
+        }
+
+        store.sync_catalog([bot], initialize=True)
+
+        scan = store.data["scan"]
+        self.assertEqual(scan["screened_ids"], [])
+        self.assertEqual(scan["screened_count"], 0)
+        self.assertEqual(scan["excluded_ids"], [99])
+        self.assertEqual(scan["excluded_count"], 1)
+
     def test_compact_catalog_stays_small_for_2300_activities(self):
         activities = [
             {
@@ -193,6 +217,29 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(added, 0)
         self.assertEqual(pending["name"], "Lake loop")
         self.assertEqual(pending["gear_id"], "new-bike")
+
+    def test_legacy_review_is_requeued_for_structured_hole_details(self):
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        activity = {
+            "id": 1,
+            "name": "Old ride",
+            "start_date": "2020-01-01T08:00:00Z",
+            "start_date_local": "2020-01-01T09:00:00Z",
+            "elapsed_time": 60,
+            "start_latlng": [47.0, 8.0],
+            "end_latlng": [47.1, 8.1],
+            "sport_type": "Ride",
+        }
+        store = JobStore(state_path)
+        store.sync_catalog([activity], initialize=True)
+        store.record_screened({1})
+        store.mark_for_review(1, "Activity 1 has 7 holes.")
+
+        added = store.sync_catalog([activity])
+
+        self.assertEqual(added, 0)
+        self.assertNotIn(1, store.data["scan"]["screened_ids"])
+        self.assertIn("1", store.data["scan"]["pending"])
 
     def test_custom_generic_reminder_is_consumed_after_rename(self):
         state_path = os.path.join(self.temporary_directory.name, "history.json")
@@ -517,6 +564,36 @@ class AutomationStateTests(unittest.TestCase):
         self.assertIn("Completed metadata updates", body)
         self.assertIn("Strava activity 901", body)
         self.assertIn("Strava activity 123", body)
+
+        review_body = _daily_mail_body(
+            deletion_jobs=[],
+            existing_source_ids=set(),
+            confirmation_jobs=[],
+            review_messages=[],
+            review_items=[
+                {
+                    "id": 456,
+                    "reason": "Activity 456 has 2 holes.",
+                    "hole_details": [
+                        {
+                            "distance_meters": 500,
+                            "origin_address": "Start A",
+                            "destination_address": "End A",
+                        },
+                        {
+                            "distance_meters": 750,
+                            "origin_address": "Start B",
+                            "destination_address": "End B",
+                        },
+                    ],
+                }
+            ],
+            name_reminders=[],
+            info_messages=[],
+        )
+        self.assertIn("2 GPS holes found", review_body)
+        self.assertIn("<strong>500 m</strong>: Start A &rarr; End A", review_body)
+        self.assertIn("<strong>750 m</strong>: Start B &rarr; End B", review_body)
 
     def test_pending_gear_is_retried_before_job_completes(self):
         source = Activity(
@@ -1139,16 +1216,16 @@ class AutomationStateTests(unittest.TestCase):
         hole_logs = [
             call
             for call in info.call_args_list
-            if call.args and call.args[0].startswith("Detected GPS hole")
+            if call.args and call.args[0].startswith("Detected {} {}")
         ]
         self.assertEqual(
             hole_logs[0].args,
             (
-                'Detected GPS hole in "{}": {} between {} and {}.',
+                'Detected {} {} in "{}":\n{}',
+                1,
+                "GPS hole",
                 "Broken Ride",
-                "1.35 km",
-                "Startstrasse 1, Zürich",
-                "Zielweg 2, Zürich",
+                "  - 1.35 km: Startstrasse 1, Zürich → Zielweg 2, Zürich",
             ),
         )
         fallback_logs = [
