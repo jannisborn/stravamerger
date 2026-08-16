@@ -5,7 +5,7 @@
 
 # StravaMerger
 
-StravaMerger automates cleanup of recent Strava activities. It can merge contiguous
+StravaMerger automates cleanup of Strava activities. It can merge contiguous
 activities, repair GPS recording holes through Google Maps, save GPX backups, upload
 replacements, and email the actions that still require manual source deletion. The
 hole repair is a headless integration of the useful parts of
@@ -36,31 +36,46 @@ over four times the direct gap, the replacement uses straight-line GPX coordinat
 intervals of at most three seconds. The email says so; add `nomerge` instead of
 deleting the source if that repair is not acceptable.
 
+Generic titles are configured as case-insensitive glob patterns. The defaults are
+`Fahrt am *`, `Lauf am *`, and every combination of
+`Morning|Afternoon|Evening` with `Run|Ride`. Repeat `--generic-name` to replace the
+default list, for example:
+
+```console
+--generic-name "Fahrt am *" --generic-name "Lunch Ride"
+```
+
 ## Fetching and persistent state
 
-`--n_activities` controls the recent activity window, not the number fully downloaded:
+`--n_activities` is the maximum number of oldest unscreened activities handled per
+run. On a fresh history, StravaMerger lists the complete summary catalog, stores only
+the compact fields needed for ordering and merge detection, and starts at the oldest.
+At the start of each later run it refreshes that read-only catalog, then:
 
-1. StravaMerger lists summary data for the window.
-2. It fetches full details for pending jobs and summary-based merge candidates.
-3. For hole detection, it fetches the description of each previously unchecked
-   activity and, unless `nomerge` or `nofix` is present, fetches its GPS stream.
-4. Only the GPS stream can reveal whether a hole exists; summary statistics cannot.
+1. It first refreshes unresolved deletions, uploads, reviews, and generic-name tasks.
+2. It screens up to `--n_activities` oldest pending entries, stopping sooner when the
+   Strava read reserve is reached.
+3. It sends one report containing both unresolved and newly found work.
 
 The program monitors
 [Strava's read-limit headers](https://developers.strava.com/docs/rate-limits/), keeps
 ten requests in reserve, and stops starting new checks when that reserve is reached.
-Completed checks are recorded in `<ofolder>/.stravamerger-state.json`. On the next
-scheduled run they are skipped, so an initial window such as 200 activities is scanned
-across multiple runs rather than all at once.
+Progress is recorded in `<ofolder>/stravamerger-state.json`. Once the historical
+catalog is exhausted, the same unchanged daily command processes only newly discovered
+activities. The summary refresh still lists the catalog so backdated uploads are not
+missed, but it does not download old descriptions or GPS streams again.
 
 Queued replacements embed their GPX data in the state file and are uploaded from
-memory. The separate GPX files in `--ofolder` are backups, not queue dependencies, so
-removing them does not break later retries. Older file-only queue entries are rebuilt
-from their Strava sources when those sources still exist.
+memory as gzip-compressed text. Separate GPX files are temporary recovery backups.
+They and the embedded data are removed after upload or cancellation; terminal jobs are
+pruned after their final notification. The compact history retains IDs, timestamps,
+unresolved reminders, and pending summaries rather than full completed activities.
 
-There is currently no `--force-refresh` flag. To perform a complete rescan, first
-resolve all pending replacements, then delete the state file. Do not delete it while
-jobs are pending: it also contains saved upload and notification state.
+There is no `--force-refresh` flag. Deleting `stravamerger-state.json` starts a new
+oldest-first pass. Do not delete it while replacements are pending because it contains
+their upload data. State files from older versions named
+`.stravamerger-state*.json` are not used by the new default path and can be removed
+after any pending replacements in them have been resolved.
 
 ## Replacement workflow and email
 
@@ -120,7 +135,7 @@ Email uses Gmail SMTP. `mail` must be an app password for the address passed to
 ```console
 uv run stravamerger \
   --credentials secret.json \
-  --n_activities 200 \
+  --n_activities 50 \
   --distance 800 \
   --ofolder tracks/ \
   --recipient name@example.com \
@@ -129,19 +144,17 @@ uv run stravamerger \
   --fix-holes
 ```
 
-Hole repair defaults to off; omit `--fix-holes` for merge-only operation. Use the same
-`--ofolder` or explicit `--state` path on every cron run so queued jobs and scan
-progress resume. Use absolute paths in cron. Run `uv run stravamerger --help` for all
-options.
+Hole repair defaults to off; omit `--fix-holes` for merge-only operation. `-n 50` is a
+safe daily upper bound on the default Strava tier; actual work may stop earlier after
+pending actions and quota usage are accounted for. Use the same `--ofolder` or
+explicit `--state` path on every cron run. Use absolute paths in cron.
 
 Replacing an activity does not preserve kudos, comments, photos, existing segment
-results, or original device attribution. Source GPX backups remain in the output
-folder.
+results, or original device attribution. Pending-job GPX backups are removed when the
+job is resolved.
 
 ## Development
 
 ```console
 uv run python -m unittest discover -s tests -v
 ```
-
-

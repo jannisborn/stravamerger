@@ -123,6 +123,23 @@ class StravaApiTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(request.call_args.args[0], self.merger.ACTIVITIES_URL)
 
+    def test_complete_activity_catalog_uses_200_item_pages(self):
+        first_page = [{"id": activity_id} for activity_id in range(200)]
+        second_page = [{"id": 200}]
+        with patch(
+            "app.requests.get",
+            side_effect=[FakeResponse(first_page), FakeResponse(second_page)],
+        ) as request:
+            result = self.merger.get_all_activities()
+
+        self.assertEqual(len(result), 201)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].kwargs["params"]["page"], 1)
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["page"], 2)
+        self.assertEqual(
+            request.call_args_list[0].kwargs["params"]["per_page"], 200
+        )
+
     def test_reported_read_quota_is_reserved_for_essential_requests(self):
         response = requests.Response()
         response.status_code = 200

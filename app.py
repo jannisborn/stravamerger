@@ -5,6 +5,7 @@ import smtplib
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -18,10 +19,12 @@ from loguru import logger
 from tqdm import tqdm
 
 from utils import (
+    DEFAULT_GENERIC_NAMES,
     NAME_DICT,
     Activity,
     CustomGPX,
     haversine,
+    is_generic_activity_name,
     parse_date,
     parse_datetime,
 )
@@ -71,6 +74,7 @@ class StravaMerger:
         dist_theta: float = 1000.0,
         hour_theta: int = 6,
         require_same_gear: bool = False,
+        generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
     ):
         """
         Initializes the StravaMerger with the necessary credentials.
@@ -81,11 +85,13 @@ class StravaMerger:
             dist_theta: Distance threshold for merging activities.
             hour_theta: Maximal pausing between adjacent activities occuring on ADJACENT days.
             require_same_gear: If True, only merge activities with identical non-empty gear_id.
+            generic_names: Case-insensitive glob patterns that identify generic titles.
         """
 
         self.dist_theta = dist_theta
         self.hour_theta = hour_theta
         self.require_same_gear = require_same_gear
+        self.generic_names = tuple(generic_names)
         self.sender_mail = sender_mail
         self.secret_path = os.path.abspath(secret_path)
 
@@ -247,23 +253,30 @@ class StravaMerger:
             raise
 
     def get_activities(self, num_activities: int) -> list[dict[str, Any]]:
-        """
-        Retrieves a list of recent activities from Strava.
+        """Retrieve at most ``num_activities`` recent activity summaries."""
+        return self._get_activity_pages(num_activities)
 
-        Args:
-            num_activities (int): The number of recent activities to retrieve.
+    def get_all_activities(self) -> list[dict[str, Any]]:
+        """Retrieve the complete activity-summary catalog."""
+        return self._get_activity_pages(None)
 
-        Returns:
-            List[Dict[str, Any]]: A list of activities, each represented as a dictionary.
-        """
+    def _get_activity_pages(
+        self, num_activities: int | None
+    ) -> list[dict[str, Any]]:
+        """Retrieve paginated activity summaries, newest first."""
 
         activities = []
         header = {"Authorization": f"Bearer {self.access_token}"}
         page = 1
         with tqdm(total=num_activities, desc="Fetching Activities") as pbar:
-            while len(activities) < num_activities:
+            while num_activities is None or len(activities) < num_activities:
+                remaining = (
+                    200
+                    if num_activities is None
+                    else min(200, num_activities - len(activities))
+                )
                 params = {
-                    "per_page": min(200, num_activities - len(activities)),
+                    "per_page": remaining,
                     "page": page,
                 }
                 response = requests.get(
@@ -273,13 +286,13 @@ class StravaMerger:
                 response.raise_for_status()
                 page_activities = response.json()
                 fetched = len(page_activities)
-                pbar.update(min(fetched, num_activities - len(activities)))
+                pbar.update(fetched)
                 activities.extend(page_activities)
                 if fetched < params["per_page"]:
                     break
                 page += 1
 
-        return activities[:num_activities]
+        return activities if num_activities is None else activities[:num_activities]
 
     @staticmethod
     def get_end_date(start_date: str, duration: int) -> str:
@@ -332,8 +345,10 @@ class StravaMerger:
         gpx: CustomGPX | None = None,
     ) -> str:
         """Choose the name for a repaired single-activity replacement."""
-        generic_name = activity.name.casefold().startswith(("fahrt am ", "lauf am "))
-        if not generic_name:
+        if not is_generic_activity_name(
+            activity.name,
+            getattr(self, "generic_names", DEFAULT_GENERIC_NAMES),
+        ):
             return activity.name
 
         def uses_location(location: tuple[float, float]) -> bool:
@@ -395,7 +410,7 @@ class StravaMerger:
                 candidate_chains.append([activity_object])
                 continue
 
-            logger.debug('Considering activity "{}"', activity_object.name)
+            logger.trace('Considering activity "{}"', activity_object.name)
             match = False
             for candidate_chain in candidate_chains:
 

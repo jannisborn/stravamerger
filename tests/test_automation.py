@@ -22,6 +22,7 @@ from automation import (
     _review_mail_body,
     _route_with_fallback,
     _upload_jobs,
+    prepare_oldest_activity_batch,
     run_automation,
 )
 from gpxfixer import GeocodingError, NoRouteError, Route, RouteError, TrackHole
@@ -80,6 +81,10 @@ class AutomationStateTests(unittest.TestCase):
         loaded_store = JobStore(state_path)
         os.unlink(gpx_path)
         self.assertEqual(loaded_store.claimed_source_ids(), {123})
+        self.assertIn(
+            "replacement_gpx_gzip", loaded_store.jobs["fix-123"]
+        )
+        self.assertNotIn("replacement_gpx", loaded_store.jobs["fix-123"])
         loaded_gpx = _load_replacement(loaded_store.jobs["fix-123"])
         self.assertEqual(loaded_gpx.activity.source_ids, [123])
         self.assertEqual(loaded_gpx.activity.external_id, "stravamerger-fix-123-v1")
@@ -94,6 +99,158 @@ class AutomationStateTests(unittest.TestCase):
             "href='https://www.strava.com/activities/123'>Strava activity 123</a>",
             email_body,
         )
+
+    def test_oldest_catalog_advances_and_includes_backdated_new_uploads(self):
+        def summary(activity_id, date):
+            return {
+                "id": activity_id,
+                "name": f"Ride {activity_id}",
+                "start_date": date,
+                "start_date_local": date,
+                "elapsed_time": 60,
+                "start_latlng": [47.0, 8.0],
+                "end_latlng": [47.1, 8.1],
+                "sport_type": "Ride",
+            }
+
+        class Merger:
+            def __init__(self):
+                self.full_calls = 0
+
+            def get_all_activities(self):
+                self.full_calls += 1
+                activities = [
+                    summary(3, "2022-01-01T08:00:00Z"),
+                    summary(2, "2021-01-01T08:00:00Z"),
+                    summary(1, "2020-01-01T08:00:00Z"),
+                ]
+                if self.full_calls > 1:
+                    activities.append(summary(4, "2019-01-01T08:00:00Z"))
+                return activities
+
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        merger = Merger()
+        store = JobStore(state_path)
+        context, batch = prepare_oldest_activity_batch(merger, store, 2)
+
+        self.assertEqual(batch, {1, 2})
+        self.assertEqual([item["id"] for item in context], [1, 2, 3])
+        store.record_screened(batch)
+
+        store = JobStore(state_path)
+        context, batch = prepare_oldest_activity_batch(merger, store, 2)
+
+        self.assertEqual(batch, {3, 4})
+        self.assertEqual([item["id"] for item in context], [4, 3])
+        self.assertEqual(merger.full_calls, 2)
+        self.assertLess(os.path.getsize(state_path), 2_000)
+
+    def test_compact_catalog_stays_small_for_2300_activities(self):
+        activities = [
+            {
+                "id": activity_id,
+                "name": f"Activity {activity_id}",
+                "start_date": f"2020-01-{activity_id % 28 + 1:02d}T08:00:00Z",
+                "start_date_local": (
+                    f"2020-01-{activity_id % 28 + 1:02d}T09:00:00Z"
+                ),
+                "elapsed_time": 3_600,
+                "start_latlng": [47.0, 8.0],
+                "end_latlng": [47.1, 8.1],
+                "gear_id": "bike-1",
+                "sport_type": "Ride",
+                "commute": False,
+                "trainer": False,
+            }
+            for activity_id in range(1, 2_301)
+        ]
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        JobStore(state_path).sync_catalog(activities, initialize=True)
+
+        self.assertLess(os.path.getsize(state_path), 1_000_000)
+
+    def test_pending_catalog_metadata_is_refreshed(self):
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        store = JobStore(state_path)
+        activity = {
+            "id": 1,
+            "name": "Morning Ride",
+            "start_date": "2020-01-01T08:00:00Z",
+            "start_date_local": "2020-01-01T09:00:00Z",
+            "elapsed_time": 60,
+            "start_latlng": [47.0, 8.0],
+            "end_latlng": [47.1, 8.1],
+            "gear_id": "old-bike",
+            "sport_type": "Ride",
+        }
+        store.sync_catalog([activity], initialize=True)
+
+        activity["name"] = "Lake loop"
+        activity["gear_id"] = "new-bike"
+        added = store.sync_catalog([activity])
+
+        pending = store.data["scan"]["pending"]["1"]
+        self.assertEqual(added, 0)
+        self.assertEqual(pending["name"], "Lake loop")
+        self.assertEqual(pending["gear_id"], "new-bike")
+
+    def test_custom_generic_reminder_is_consumed_after_rename(self):
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+
+        class Merger:
+            google_maps_api_key = None
+
+            def __init__(self):
+                self.name = "Lunch Run"
+                self.emails = []
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+            def get_activity(self, activity_id):
+                return {
+                    "id": activity_id,
+                    "name": self.name,
+                    "description": "",
+                }
+
+            def send_email(self, recipient, subject, body):
+                self.emails.append((recipient, subject, body))
+                return True
+
+        merger = Merger()
+        first = run_automation(
+            merger,
+            activities=[
+                {
+                    "id": 10,
+                    "name": "Lunch Run",
+                    "start_latlng": [],
+                }
+            ],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+            generic_names=("Lunch *",),
+        )
+
+        self.assertEqual(first.screened_activity_ids, {10})
+        self.assertIn("10", JobStore(state_path).data["name_reminders"])
+        self.assertIn("Rename generic activities", merger.emails[0][2])
+
+        merger.name = "Canal recovery"
+        run_automation(
+            merger,
+            activities=[],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+            generic_names=("Lunch *",),
+        )
+
+        self.assertNotIn("10", JobStore(state_path).data["name_reminders"])
+        self.assertEqual(len(merger.emails), 1)
 
     def test_routing_fallback_is_limited_to_no_route_or_indirect_route(self):
         hole = TrackHole(
@@ -322,24 +479,20 @@ class AutomationStateTests(unittest.TestCase):
             state_path=state_path,
         )
 
-        recovered = JobStore(state_path).jobs["fix-10"]
-        self.assertEqual(recovered["status"], "complete")
-        self.assertEqual(recovered["uploaded_activity_id"], 901)
-        self.assertEqual(
-            recovered["confirmation_notification_recipient"],
-            "me@example.com",
-        )
+        self.assertNotIn("fix-10", JobStore(state_path).jobs)
         self.assertEqual(len(merger.emails), 1)
         self.assertEqual(merger.emails[0][1], "StravaMerger - Daily report")
         self.assertIn("Strava activity 901", merger.emails[0][2])
 
     def test_generic_activity_names_and_combined_report(self):
         self.assertTrue(_needs_name_change("Fahrt am Morgen"))
+        self.assertTrue(_needs_name_change("Fahrt am"))
         self.assertTrue(_needs_name_change("Lauf am Nachmittag"))
         self.assertTrue(_needs_name_change("Morning Ride"))
         self.assertTrue(_needs_name_change("Evening Run"))
         self.assertFalse(_needs_name_change("Morning gravel with friends"))
         self.assertFalse(_needs_name_change("Lunch Ride"))
+        self.assertTrue(_needs_name_change("Lunch Ride", ("Lunch *",)))
 
         body = _daily_mail_body(
             deletion_jobs=[],
@@ -431,9 +584,7 @@ class AutomationStateTests(unittest.TestCase):
             state_path=state_path,
         )
 
-        completed = JobStore(state_path).jobs["fix-10"]
-        self.assertEqual(completed["status"], "complete")
-        self.assertFalse(completed["gear_update_pending"])
+        self.assertNotIn("fix-10", JobStore(state_path).jobs)
         self.assertEqual(merger.gear_updates, [(901, "bike-1")])
         self.assertEqual(len(merger.emails), 1)
         self.assertIn("Restored gear", merger.emails[0][2])
@@ -542,16 +693,12 @@ class AutomationStateTests(unittest.TestCase):
             state_path=state_path,
         )
 
-        uploaded = JobStore(state_path).jobs["fix-10"]
-        self.assertEqual(uploaded["status"], "uploaded")
-        self.assertEqual(uploaded["uploaded_activity_id"], 901)
+        self.assertNotIn("fix-10", JobStore(state_path).jobs)
         self.assertEqual(len(merger.uploads), 1)
         self.assertEqual(len(merger.emails), 2)
         self.assertIn("Uploaded replacements", merger.emails[1][2])
         self.assertFalse(os.path.exists(source_path))
         self.assertFalse(os.path.exists(replacement_path))
-        self.assertNotIn("replacement_gpx", uploaded)
-        self.assertEqual(uploaded["artifact_paths"], [])
 
     def test_address_lookup_failure_falls_back_to_coordinates(self):
         class Geocoder:
@@ -712,8 +859,7 @@ class AutomationStateTests(unittest.TestCase):
                 fix_holes=True,
             )
 
-        job = JobStore(state_path).jobs["fix-10"]
-        self.assertEqual(job["status"], "cancelled")
+        self.assertNotIn("fix-10", JobStore(state_path).jobs)
         cancellation_logs = [
             call
             for call in info.call_args_list
@@ -721,7 +867,6 @@ class AutomationStateTests(unittest.TestCase):
         ]
         self.assertEqual(cancellation_logs[0].args[1], "Broken Ride")
         self.assertFalse(os.path.exists(artifact_path))
-        self.assertNotIn("replacement_gpx", job)
 
     def test_file_only_job_is_marked_for_rebuild_without_opening_gpx(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")
@@ -1061,12 +1206,7 @@ class AutomationStateTests(unittest.TestCase):
             state_path=state_path,
         )
         self.assertEqual(completed.uploaded_jobs, 1)
-        completed_job = JobStore(state_path).jobs["fix-10"]
-        self.assertEqual(completed_job["status"], "uploaded")
-        self.assertEqual(
-            completed_job["confirmation_notification_recipient"],
-            "me@example.com",
-        )
+        self.assertNotIn("fix-10", JobStore(state_path).jobs)
         self.assertEqual(merger.upload_attempts, 1)
         self.assertEqual(len(merger.emails), 3)
         self.assertEqual(merger.emails[2][1], "StravaMerger - Daily report")

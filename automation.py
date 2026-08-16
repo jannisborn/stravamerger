@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import gzip
 import json
 import os
 import re
 import tempfile
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from html import escape
@@ -32,14 +35,30 @@ from gpxfixer import (
     travel_mode_for_sport,
     validate_route,
 )
-from utils import Activity, CustomGPX
+from utils import (
+    DEFAULT_GENERIC_NAMES,
+    Activity,
+    CustomGPX,
+    is_generic_activity_name,
+)
 
 MAX_HOLES_PER_ACTIVITY = 5
 READ_REQUEST_RESERVE = 10
 ACTIVITY_ID_PATTERN = re.compile(r"\b([Aa]ctivity) (\d+)\b")
-GERMAN_GENERIC_NAME_PATTERN = re.compile(r"^(?:fahrt|lauf) am\b", re.IGNORECASE)
-ENGLISH_GENERIC_NAME_PATTERN = re.compile(
-    r"^(?:morning|afternoon|evening) (?:run|ride)$", re.IGNORECASE
+CATALOG_KEYS = (
+    "id",
+    "name",
+    "start_date",
+    "start_date_local",
+    "elapsed_time",
+    "start_latlng",
+    "end_latlng",
+    "gear_id",
+    "sport_type",
+    "type",
+    "commute",
+    "trainer",
+    "external_id",
 )
 
 
@@ -52,6 +71,7 @@ class AutomationSummary:
     deferred_jobs: int = 0
     review_messages: list[str] = field(default_factory=list)
     info_messages: list[str] = field(default_factory=list)
+    screened_activity_ids: set[int] = field(default_factory=set)
 
 
 class JobStore:
@@ -68,6 +88,16 @@ class JobStore:
             self.data = loaded
         self.data.setdefault("checks", {})
         self.data.setdefault("reviews", {})
+        self.data.setdefault("name_reminders", {})
+        self.data.setdefault(
+            "scan",
+            {
+                "initialized": False,
+                "pending": {},
+                "screened_ids": [],
+                "last_screened_start_date": None,
+            },
+        )
 
     @property
     def jobs(self) -> dict[str, dict[str, Any]]:
@@ -102,6 +132,124 @@ class JobStore:
         if self.data["reviews"].pop(str(activity_id), None) is not None:
             self.save()
 
+    @property
+    def scan_initialized(self) -> bool:
+        return bool(self.data["scan"].get("initialized"))
+
+    def sync_catalog(
+        self,
+        activities: list[dict[str, Any]],
+        *,
+        initialize: bool = False,
+    ) -> int:
+        """Refresh the compact oldest-first catalog and add unseen summaries."""
+        scan = self.data["scan"]
+        screened = {int(activity_id) for activity_id in scan["screened_ids"]}
+        pending = scan["pending"]
+        added = 0
+        for activity in activities:
+            activity_id = int(activity["id"])
+            key = str(activity_id)
+            if activity_id in screened:
+                continue
+            if StravaMerger.is_bot_activity(activity):
+                pending.pop(key, None)
+                screened.add(activity_id)
+                continue
+            is_new = key not in pending
+            pending[key] = {
+                field: activity.get(field)
+                for field in CATALOG_KEYS
+                if field in activity
+            }
+            added += int(is_new)
+        scan["screened_ids"] = sorted(screened)
+        if initialize:
+            scan["initialized"] = True
+            scan["initialized_at"] = _now()
+        scan["pending_count"] = len(pending)
+        scan["screened_count"] = len(screened)
+        scan["updated_at"] = _now()
+        self.save()
+        return added
+
+    def oldest_batch(
+        self, limit: int
+    ) -> tuple[list[dict[str, Any]], set[int]]:
+        """Return all pending context and IDs of the oldest batch to screen."""
+        if limit <= 0:
+            raise ValueError("The activity batch size must be positive.")
+        pending = list(self.data["scan"]["pending"].values())
+        pending.sort(
+            key=lambda activity: (
+                activity.get("start_date_local")
+                or activity.get("start_date")
+                or "",
+                activity["id"],
+            )
+        )
+        return pending, {activity["id"] for activity in pending[:limit]}
+
+    def record_screened(self, activity_ids: set[int]) -> None:
+        """Consume screened catalog entries while retaining compact ID history."""
+        if not activity_ids:
+            return
+        scan = self.data["scan"]
+        screened = {int(activity_id) for activity_id in scan["screened_ids"]}
+        dates = []
+        for activity_id in activity_ids:
+            summary = scan["pending"].pop(str(activity_id), None)
+            if summary:
+                date = summary.get("start_date_local") or summary.get("start_date")
+                if date:
+                    dates.append(date)
+            screened.add(int(activity_id))
+            self.data["checks"].pop(str(activity_id), None)
+        scan["screened_ids"] = sorted(screened)
+        if dates:
+            previous = scan.get("last_screened_start_date")
+            scan["last_screened_start_date"] = max(
+                [date for date in (previous, *dates) if date]
+            )
+        scan["screened_count"] = len(screened)
+        scan["pending_count"] = len(scan["pending"])
+        scan["updated_at"] = _now()
+        self.save()
+
+    def update_name_reminder(
+        self,
+        activity: dict[str, Any],
+        generic_names: Sequence[str],
+    ) -> None:
+        key = str(activity["id"])
+        if is_generic_activity_name(activity.get("name") or "", generic_names):
+            self.data["name_reminders"][key] = {
+                "id": activity["id"],
+                "name": activity["name"],
+                "url": activity.get("url"),
+            }
+        else:
+            self.data["name_reminders"].pop(key, None)
+
+    def remove_name_reminder(self, activity_id: int) -> None:
+        self.data["name_reminders"].pop(str(activity_id), None)
+
+    def prune_terminal_jobs(self, recipient: str) -> None:
+        """Drop resolved queue entries after their final notification was delivered."""
+        removable = []
+        for job_id, job in self.jobs.items():
+            if job.get("rebuild_required") or job.get("gear_update_pending"):
+                continue
+            if job["status"] == "cancelled":
+                removable.append(job_id)
+            elif (
+                job["status"] in {"uploaded", "complete"}
+                and job.get("confirmation_notification_recipient") == recipient
+            ):
+                removable.append(job_id)
+        for job_id in removable:
+            del self.jobs[job_id]
+
     def add(
         self,
         *,
@@ -125,6 +273,7 @@ class JobStore:
         ]
         if replacement.activity.filepath:
             artifact_paths.append(replacement.activity.filepath)
+        replacement_xml = replacement.to_xml().encode("utf-8")
         job = {
             "id": job_id,
             "kind": kind,
@@ -142,7 +291,9 @@ class JobStore:
                 for source in source_activities
             },
             "replacement": replacement_data,
-            "replacement_gpx": replacement.to_xml(),
+            "replacement_gpx_gzip": base64.b64encode(
+                gzip.compress(replacement_xml)
+            ).decode("ascii"),
             "artifact_paths": list(dict.fromkeys(artifact_paths)),
             "status": "awaiting_deletion",
             "delete_notified": False,
@@ -165,13 +316,58 @@ class JobStore:
         )
         try:
             with os.fdopen(descriptor, "w") as file:
-                json.dump(self.data, file, indent=2)
+                json.dump(
+                    self.data,
+                    file,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 file.write("\n")
             os.replace(temporary_path, self.path)
         except Exception:
             if os.path.exists(temporary_path):
                 os.unlink(temporary_path)
             raise
+
+
+def prepare_oldest_activity_batch(
+    merger: StravaMerger,
+    store: JobStore,
+    limit: int,
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """Synchronize the catalog and select the oldest unseen daily batch."""
+    catalog = merger.get_all_activities()
+    if not store.scan_initialized:
+        added = store.sync_catalog(catalog, initialize=True)
+        logger.info(
+            "Initialized oldest-first scan catalog with {} activities.", added
+        )
+    else:
+        added = store.sync_catalog(catalog)
+        logger.info("Added {} newly seen activities to the scan catalog.", added)
+    activities, scan_ids = store.oldest_batch(limit)
+    if scan_ids:
+        oldest = min(
+            (
+                activity
+                for activity in activities
+                if activity["id"] in scan_ids
+            ),
+            key=lambda activity: (
+                activity.get("start_date_local")
+                or activity.get("start_date")
+                or "",
+                activity["id"],
+            ),
+        )
+        logger.info(
+            "Selected {} oldest unscreened activities starting at {}.",
+            len(scan_ids),
+            oldest.get("start_date_local") or oldest.get("start_date"),
+        )
+    else:
+        logger.info("The oldest-first activity catalog is caught up.")
+    return activities, scan_ids
 
 
 def run_automation(
@@ -184,14 +380,34 @@ def run_automation(
     fix_holes: bool = False,
     hole_time_threshold: float = 5.0,
     hole_distance_threshold: float = 400.0,
+    scan_activity_ids: set[int] | None = None,
+    generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
 ) -> AutomationSummary:
     """Resume queued jobs, discover new replacements, and upload what is ready."""
     if hole_time_threshold < 0 or hole_distance_threshold < 0:
         raise ValueError("Hole detection thresholds cannot be negative.")
     store = JobStore(state_path)
     summary = AutomationSummary()
+    scan_activity_ids = (
+        {activity["id"] for activity in activities}
+        if scan_activity_ids is None
+        else set(scan_activity_ids)
+    )
     activities_by_id = {activity["id"]: activity for activity in activities}
     source_exists_cache = {activity_id: True for activity_id in activities_by_id}
+    _refresh_name_reminders(
+        merger,
+        store,
+        generic_names=generic_names,
+        activities_by_id=activities_by_id,
+        source_exists_cache=source_exists_cache,
+    )
+    _refresh_reviews(
+        merger,
+        store,
+        activities_by_id=activities_by_id,
+        source_exists_cache=source_exists_cache,
+    )
     _refresh_pending_source_activities(
         merger,
         store,
@@ -231,8 +447,14 @@ def run_automation(
             activities=activities,
             activities_by_id=activities_by_id,
             source_exists_cache=source_exists_cache,
+            generic_names=generic_names,
         )
         raise
+    merge_chains = [
+        chain
+        for chain in merge_chains
+        if any(activity.id in scan_activity_ids for activity in chain)
+    ]
     merge_chains.sort(
         key=lambda chain: not any(
             activity.id in rebuild_source_ids for activity in chain
@@ -388,13 +610,27 @@ def run_automation(
             )
             for activity in chain
         ]
+        for activity in detailed_activities:
+            if activity is not None:
+                store.update_name_reminder(activity, generic_names)
         if any(activity is None for activity in detailed_activities):
+            merged_source_ids.difference_update(
+                activity.id for activity in chain
+            )
+            summary.screened_activity_ids.update(
+                original.id
+                for original, detailed in zip(chain, detailed_activities)
+                if detailed is None
+            )
             continue
         if any(
             "nomerge" in (activity.get("description") or "").lower()
             or StravaMerger.is_bot_activity(activity)
             for activity in detailed_activities
         ):
+            merged_source_ids.difference_update(
+                activity.id for activity in chain
+            )
             continue
         chain = [
             merger.activity_from_api(activity) for activity in detailed_activities
@@ -404,6 +640,9 @@ def run_automation(
             and "nofix" not in activity.description.lower()
             for activity in chain
         ):
+            merged_source_ids.difference_update(
+                activity.id for activity in chain
+            )
             continue
         original_gpxs = [fetch(activity) for activity in chain]
         replacement_inputs = []
@@ -422,6 +661,9 @@ def run_automation(
             ]
             repaired_count += len(details)
         if not replacement_inputs:
+            merged_source_ids.difference_update(
+                activity.id for activity in chain
+            )
             continue
 
         replacement_activity = merger.get_new_activity(replacement_inputs)
@@ -462,23 +704,33 @@ def run_automation(
         summary.merged_jobs += 1
         summary.deferred_jobs += 1
         summary.repaired_holes += repaired_count
+        summary.screened_activity_ids.update(source_ids)
 
-    for api_activity in available if fix_holes and not scan_budget_exhausted else []:
+    for api_activity in available if not scan_budget_exhausted else []:
+        activity_id = api_activity["id"]
+        if activity_id not in scan_activity_ids:
+            continue
+        store.update_name_reminder(api_activity, generic_names)
+        if activity_id in merged_source_ids:
+            continue
         if (
-            api_activity["id"] in merged_source_ids
-            or not api_activity.get("start_latlng")
+            not api_activity.get("start_latlng")
             or StravaMerger.is_bot_activity(api_activity)
             or (
                 "description" in api_activity
                 and not merger.can_fix_activity(api_activity)
             )
-            or store.was_checked_clean(api_activity["id"])
-            or _review_blocks_retry(store, api_activity["id"])
+            or store.was_checked_clean(activity_id)
+            or _review_blocks_retry(store, activity_id)
         ):
+            summary.screened_activity_ids.add(activity_id)
+            continue
+        if not fix_holes:
+            summary.screened_activity_ids.add(activity_id)
             continue
         requests_needed = 1 + _activity_detail_request_needed(
             merger,
-            api_activity["id"],
+            activity_id,
             activities_by_id,
         )
         if not _has_read_capacity(merger, requests_needed):
@@ -486,16 +738,27 @@ def run_automation(
             break
         api_activity = _get_detailed_activity(
             merger,
-            api_activity["id"],
+            activity_id,
             activities_by_id,
             source_exists_cache,
         )
-        if api_activity is None or not merger.can_fix_activity(api_activity):
+        if api_activity is None:
+            summary.screened_activity_ids.add(activity_id)
+            store.remove_name_reminder(activity_id)
+            continue
+        store.update_name_reminder(api_activity, generic_names)
+        if not merger.can_fix_activity(api_activity):
+            summary.screened_activity_ids.add(activity_id)
             continue
         source = merger.activity_from_api(api_activity)
         original = fetch(source)
         repaired, hole_details = repair(original)
-        if repaired is None or not hole_details:
+        if repaired is None:
+            if store.review_reason(source.id):
+                summary.screened_activity_ids.add(source.id)
+            continue
+        if not hole_details:
+            summary.screened_activity_ids.add(source.id)
             continue
 
         replacement = repaired
@@ -525,6 +788,7 @@ def run_automation(
         summary.repaired_jobs += 1
         summary.deferred_jobs += 1
         summary.repaired_holes += len(hole_details)
+        summary.screened_activity_ids.add(source.id)
 
     _send_daily_report(
         merger,
@@ -534,7 +798,10 @@ def run_automation(
         activities=activities,
         activities_by_id=activities_by_id,
         source_exists_cache=source_exists_cache,
+        generic_names=generic_names,
     )
+    store.prune_terminal_jobs(recipient)
+    store.save()
     return summary
 
 
@@ -576,7 +843,7 @@ def _resume_jobs(
             continue
         if (
             job["status"] in {"awaiting_deletion", "ready"}
-            and not job.get("replacement_gpx")
+            and not _has_replacement_gpx(job)
         ):
             source_exists = any(
                 _source_exists(merger, source_id, source_exists_cache)
@@ -750,6 +1017,76 @@ def _get_detailed_activity(
     return activity
 
 
+def _refresh_name_reminders(
+    merger: StravaMerger,
+    store: JobStore,
+    *,
+    generic_names: Sequence[str],
+    activities_by_id: dict[int, dict[str, Any]],
+    source_exists_cache: dict[int, bool],
+) -> None:
+    """Refresh unresolved generic titles before scanning new activities."""
+    get_activity = getattr(merger, "get_activity", None)
+    if not callable(get_activity):
+        return
+    for activity_id_text in list(store.data["name_reminders"]):
+        activity_id = int(activity_id_text)
+        activity = activities_by_id.get(activity_id)
+        if activity is None or "description" not in activity:
+            if not _has_read_capacity(merger, 1):
+                logger.warning(
+                    "Could not refresh all generic-name reminders without using "
+                    "the reserved read quota."
+                )
+                return
+            activity = _get_detailed_activity(
+                merger,
+                activity_id,
+                activities_by_id,
+                source_exists_cache,
+            )
+        if activity is None:
+            store.remove_name_reminder(activity_id)
+        else:
+            store.update_name_reminder(activity, generic_names)
+    store.save()
+
+
+def _refresh_reviews(
+    merger: StravaMerger,
+    store: JobStore,
+    *,
+    activities_by_id: dict[int, dict[str, Any]],
+    source_exists_cache: dict[int, bool],
+) -> None:
+    """Refresh manual-review items and consume explicit opt-outs."""
+    get_activity = getattr(merger, "get_activity", None)
+    if not callable(get_activity):
+        return
+    for activity_id_text in list(store.data["reviews"]):
+        activity_id = int(activity_id_text)
+        activity = activities_by_id.get(activity_id)
+        if activity is None or "description" not in activity:
+            if not _has_read_capacity(merger, 1):
+                logger.warning(
+                    "Could not refresh all review items without using the reserved "
+                    "read quota."
+                )
+                return
+            activity = _get_detailed_activity(
+                merger,
+                activity_id,
+                activities_by_id,
+                source_exists_cache,
+            )
+        description = (activity or {}).get("description") or ""
+        if activity is None or any(
+            marker in description.lower() for marker in ("nomerge", "nofix")
+        ):
+            store.data["reviews"].pop(activity_id_text, None)
+    store.save()
+
+
 def _refresh_pending_source_activities(
     merger: StravaMerger,
     store: JobStore,
@@ -819,6 +1156,7 @@ def _send_daily_report(
     activities: list[dict[str, Any]],
     activities_by_id: dict[int, dict[str, Any]],
     source_exists_cache: dict[int, bool],
+    generic_names: Sequence[str],
 ) -> None:
     deletion_jobs, existing_source_ids = _outstanding_deletions(
         merger,
@@ -834,6 +1172,9 @@ def _send_daily_report(
     ]
     review_messages = list(summary.review_messages)
     review_messages.extend(
+        review["reason"] for review in store.data["reviews"].values()
+    )
+    review_messages.extend(
         f'Replacement "{job["replacement"].get("name", job["id"])}" requires '
         f'manual review: {job.get("last_error") or "reason unavailable"}'
         for job in store.jobs.values()
@@ -844,19 +1185,21 @@ def _send_daily_report(
     claimed_source_ids = store.claimed_source_ids()
     name_reminders = [
         activity
-        for activity in activities
+        for activity in store.data["name_reminders"].values()
         if activity["id"] not in claimed_source_ids
-        and _needs_name_change(activity.get("name") or "")
     ]
     known_reminder_ids = {activity["id"] for activity in name_reminders}
     for job in confirmation_jobs:
         replacement = job["replacement"]
         if (
             replacement.get("id") not in known_reminder_ids
-            and _needs_name_change(replacement.get("name") or "")
+            and is_generic_activity_name(
+                replacement.get("name") or "", generic_names
+            )
         ):
             name_reminders.append(replacement)
             known_reminder_ids.add(replacement["id"])
+            store.update_name_reminder(replacement, generic_names)
 
     if not any(
         (
@@ -1037,6 +1380,13 @@ def _fixed_activity(
 
 def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     xml = job.get("replacement_gpx")
+    if not xml and job.get("replacement_gpx_gzip"):
+        try:
+            xml = gzip.decompress(
+                base64.b64decode(job["replacement_gpx_gzip"])
+            ).decode("utf-8")
+        except (OSError, ValueError, UnicodeDecodeError) as error:
+            raise ValueError("Queued replacement GPX data is corrupt.") from error
     if not xml:
         raise ValueError("Queued job has no embedded replacement GPX data.")
     parsed = gpxpy.parse(xml)
@@ -1049,6 +1399,10 @@ def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     gpx.waypoints = parsed.waypoints
     gpx.set_activity(Activity(**job["replacement"]))
     return gpx
+
+
+def _has_replacement_gpx(job: dict[str, Any]) -> bool:
+    return bool(job.get("replacement_gpx") or job.get("replacement_gpx_gzip"))
 
 
 def _cleanup_job_artifacts(job: dict[str, Any]) -> bool:
@@ -1094,6 +1448,7 @@ def _cleanup_job_artifacts(job: dict[str, Any]) -> bool:
         return False
 
     job.pop("replacement_gpx", None)
+    job.pop("replacement_gpx_gzip", None)
     job["artifact_paths"] = []
     job.get("replacement", {})["filepath"] = None
     for source in job.get("sources", []):
@@ -1315,12 +1670,11 @@ def _append_hole_repair_summary(
     return f"{description.rstrip('.')} · {_hole_repair_summary(hole_details)}."
 
 
-def _needs_name_change(name: str) -> bool:
-    normalized = name.strip()
-    return bool(
-        GERMAN_GENERIC_NAME_PATTERN.match(normalized)
-        or ENGLISH_GENERIC_NAME_PATTERN.fullmatch(normalized)
-    )
+def _needs_name_change(
+    name: str,
+    generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
+) -> bool:
+    return is_generic_activity_name(name, generic_names)
 
 
 def _format_hole_detail(detail: dict[str, Any]) -> str:

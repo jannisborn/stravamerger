@@ -1,10 +1,12 @@
 import os
+from collections.abc import Sequence
 
 import typer
 from loguru import logger
 
 from app import StravaMerger, StravaRateLimitError
-from automation import run_automation
+from automation import JobStore, prepare_oldest_activity_batch, run_automation
+from utils import DEFAULT_GENERIC_NAMES
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -22,22 +24,26 @@ def run(
     hole_time_threshold: float,
     hole_distance_threshold: float,
     state_path: str | None,
+    generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
 ) -> None:
     merger = StravaMerger(
         credential_path,
         sender_mail=sender,
         dist_theta=distance,
         require_same_gear=require_same_gear,
+        generic_names=generic_names,
     )
     try:
         merger.refresh_access_token()
 
-        # Fetch activities
-        activities = merger.get_activities(n_activities)
-        logger.info(f"Fetched {len(activities)} activities.")
-
         state_path = state_path or os.path.join(
-            output_folder, ".stravamerger-state.json"
+            output_folder, "stravamerger-state.json"
+        )
+        store = JobStore(state_path)
+        activities, scan_activity_ids = prepare_oldest_activity_batch(
+            merger,
+            store,
+            n_activities,
         )
         summary = run_automation(
             merger,
@@ -48,6 +54,19 @@ def run(
             fix_holes=fix_holes,
             hole_time_threshold=hole_time_threshold,
             hole_distance_threshold=hole_distance_threshold,
+            scan_activity_ids=scan_activity_ids,
+            generic_names=generic_names,
+        )
+        store = JobStore(state_path)
+        store.record_screened(
+            summary.screened_activity_ids | store.claimed_source_ids()
+        )
+        scan = store.data["scan"]
+        logger.info(
+            "History progress: {} screened, {} pending; latest screened start {}.",
+            scan.get("screened_count", 0),
+            scan.get("pending_count", 0),
+            scan.get("last_screened_start_date") or "none",
         )
     except StravaRateLimitError as error:
         logger.error("{}", error)
@@ -85,7 +104,10 @@ def merge(
         help="Gmail sender; omit to disable email notifications.",
     ),
     n_activities: int = typer.Option(
-        ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
+        ...,
+        "--n_activities",
+        "-n",
+        help="Maximum number of oldest unscreened activities to process per run.",
     ),
     output_folder: str = typer.Option(
         ..., "--ofolder", "-o", help="Folder path to save output files."
@@ -116,7 +138,15 @@ def merge(
     state_path: str | None = typer.Option(
         None,
         "--state",
-        help="Persistent job-state JSON (defaults inside --ofolder).",
+        help=(
+            "Persistent history JSON (defaults to stravamerger-state.json "
+            "in --ofolder)."
+        ),
+    ),
+    generic_names: list[str] | None = typer.Option(
+        None,
+        "--generic-name",
+        help="Generic title glob; repeat to replace the default list.",
     ),
 ):
     """Merge split activities, repair GPS holes, and upload replacements."""
@@ -134,6 +164,7 @@ def merge(
         hole_time_threshold=hole_time_threshold,
         hole_distance_threshold=hole_distance_threshold,
         state_path=state_path,
+        generic_names=generic_names or DEFAULT_GENERIC_NAMES,
     )
 
 
@@ -158,7 +189,10 @@ def run_cmd(
         help="Gmail sender; omit to disable email notifications.",
     ),
     n_activities: int = typer.Option(
-        ..., "--n_activities", "-n", help="Number of recent activities to retrieve."
+        ...,
+        "--n_activities",
+        "-n",
+        help="Maximum number of oldest unscreened activities to process per run.",
     ),
     output_folder: str = typer.Option(
         ..., "--ofolder", "-o", help="Folder path to save output files."
@@ -189,7 +223,15 @@ def run_cmd(
     state_path: str | None = typer.Option(
         None,
         "--state",
-        help="Persistent job-state JSON (defaults inside --ofolder).",
+        help=(
+            "Persistent history JSON (defaults to stravamerger-state.json "
+            "in --ofolder)."
+        ),
+    ),
+    generic_names: list[str] | None = typer.Option(
+        None,
+        "--generic-name",
+        help="Generic title glob; repeat to replace the default list.",
     ),
 ):
     """Alias for the default command."""
@@ -205,6 +247,7 @@ def run_cmd(
         hole_time_threshold=hole_time_threshold,
         hole_distance_threshold=hole_distance_threshold,
         state_path=state_path,
+        generic_names=generic_names or DEFAULT_GENERIC_NAMES,
     )
 
 
