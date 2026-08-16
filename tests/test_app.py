@@ -210,7 +210,53 @@ class StravaApiTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.activity_id, 987)
+        self.assertFalse(result.gear_applied)
+        self.assertEqual(result.gear_error, "rate limit reached")
         self.assertEqual(gpx.activity.url, "https://www.strava.com/activities/987")
+
+    def test_merge_preserves_one_unambiguous_gear_and_minute_timestamp(self):
+        activities = []
+        for activity_id, gear_id in ((1, "bike-1"), (2, None)):
+            gpx = CustomGPX()
+            gpx.set_activity(
+                Activity(
+                    name=f"Ride {activity_id}",
+                    id=activity_id,
+                    start_date="2026-08-13T07:00:00Z",
+                    end_date="2026-08-13T08:00:00Z",
+                    start_coords=(47.0, 8.0),
+                    end_coords=(47.1, 8.1),
+                    gear_id=gear_id,
+                    sport="Ride",
+                )
+            )
+            activities.append(gpx)
+
+        merged = self.merger.get_new_activity(activities)
+
+        self.assertEqual(merged.gear_id, "bike-1")
+        self.assertRegex(
+            merged.description,
+            r"StravaMerger bot · merged activities 1 \+ 2 · "
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\.$",
+        )
+        self.assertNotRegex(merged.description, r"\d{2}:\d{2}:\d{2}")
+
+        activities[1].activity.gear_id = "bike-2"
+        self.assertIsNone(self.merger.get_new_activity(activities).gear_id)
+
+    def test_update_activity_gear_uses_replacement_and_source_gear(self):
+        with patch(
+            "app.requests.put", return_value=FakeResponse({}, status_code=200)
+        ) as request:
+            applied, error = self.merger.update_activity_gear(987, "bike-1")
+
+        self.assertTrue(applied)
+        self.assertIsNone(error)
+        self.assertEqual(
+            request.call_args.kwargs["data"], {"gear_id": "bike-1"}
+        )
+        self.assertTrue(request.call_args.args[0].endswith("/activities/987"))
 
     def test_duplicate_activity_id_accepts_strava_html_link(self):
         error = (

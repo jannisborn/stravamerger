@@ -14,9 +14,11 @@ from automation import (
     AutomationSummary,
     JobStore,
     _address_for,
+    _daily_mail_body,
     _delete_mail_body,
     _fixed_activity,
     _load_replacement,
+    _needs_name_change,
     _review_mail_body,
     _route_with_fallback,
     _upload_jobs,
@@ -135,6 +137,41 @@ class AutomationStateTests(unittest.TestCase):
         with self.assertRaisesRegex(RouteError, "quota exceeded"):
             _route_with_fallback(ApiFailure(), hole, "BICYCLE")
 
+    def test_fixed_activity_preserves_gear_and_has_concise_hole_description(self):
+        source = Activity(
+            name="Broken Ride",
+            id=10,
+            start_date="2026-08-13T07:00:00Z",
+            end_date="2026-08-13T08:00:00Z",
+            start_coords=(47.0, 8.0),
+            end_coords=(47.1, 8.1),
+            gear_id="bike-1",
+            sport="Ride",
+            description="Original note",
+        )
+        replacement = _fixed_activity(
+            source,
+            1,
+            hole_details=[
+                {
+                    "distance_meters": 1_500,
+                    "origin_address": "Start Street 1, Zürich, Switzerland",
+                    "destination_address": "End Street 2, Zürich, Switzerland",
+                }
+            ],
+        )
+
+        self.assertEqual(replacement.gear_id, "bike-1")
+        self.assertIn(
+            "fixed 1 GPS gap: 1.50 km Start Street 1 → End Street 2",
+            replacement.description,
+        )
+        self.assertRegex(
+            replacement.description,
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\.$",
+        )
+        self.assertNotRegex(replacement.description, r"\d{2}:\d{2}:\d{2}")
+
     def test_review_mail_links_activity_id(self):
         body = _review_mail_body(["Activity 456 was not repaired"])
 
@@ -143,7 +180,7 @@ class AutomationStateTests(unittest.TestCase):
             body,
         )
 
-    def test_partial_uploads_are_saved_and_emailed_before_rate_limit(self):
+    def test_partial_uploads_are_saved_before_rate_limit(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")
         store = JobStore(state_path)
         for source_id in (1, 2):
@@ -205,21 +242,19 @@ class AutomationStateTests(unittest.TestCase):
                 merger,
                 store,
                 ["fix-1", "fix-2"],
-                "me@example.com",
                 summary,
             )
 
         reloaded = JobStore(state_path)
         self.assertEqual(reloaded.jobs["fix-1"]["status"], "uploaded")
-        self.assertEqual(reloaded.jobs["fix-2"]["status"], "ready")
         self.assertEqual(
-            reloaded.jobs["fix-1"]["confirmation_notification_recipient"],
-            "me@example.com",
+            reloaded.jobs["fix-2"]["status"], "awaiting_deletion"
+        )
+        self.assertIsNone(
+            reloaded.jobs["fix-1"]["confirmation_notification_recipient"]
         )
         self.assertEqual(summary.uploaded_jobs, 1)
-        self.assertEqual(len(merger.emails), 1)
-        self.assertEqual(merger.emails[0][1], "StravaMerger - New activities")
-        self.assertIn("Strava activity 901", merger.emails[0][2])
+        self.assertEqual(len(merger.emails), 0)
 
     def test_orphaned_upload_is_recovered_and_confirmed(self):
         source = Activity(
@@ -295,8 +330,211 @@ class AutomationStateTests(unittest.TestCase):
             "me@example.com",
         )
         self.assertEqual(len(merger.emails), 1)
-        self.assertEqual(merger.emails[0][1], "StravaMerger - New activities")
+        self.assertEqual(merger.emails[0][1], "StravaMerger - Daily report")
         self.assertIn("Strava activity 901", merger.emails[0][2])
+
+    def test_generic_activity_names_and_combined_report(self):
+        self.assertTrue(_needs_name_change("Fahrt am Morgen"))
+        self.assertTrue(_needs_name_change("Lauf am Nachmittag"))
+        self.assertTrue(_needs_name_change("Morning Ride"))
+        self.assertTrue(_needs_name_change("Evening Run"))
+        self.assertFalse(_needs_name_change("Morning gravel with friends"))
+        self.assertFalse(_needs_name_change("Lunch Ride"))
+
+        body = _daily_mail_body(
+            deletion_jobs=[],
+            existing_source_ids=set(),
+            confirmation_jobs=[
+                {
+                    "replacement": {
+                        "id": 901,
+                        "name": "Uploaded Ride",
+                        "url": "https://www.strava.com/activities/901",
+                    }
+                }
+            ],
+            review_messages=["Activity 456 needs review"],
+            name_reminders=[{"id": 123, "name": "Morning Ride"}],
+            info_messages=["Restored gear on replacement."],
+        )
+
+        self.assertIn("Uploaded replacements", body)
+        self.assertIn("Rename generic activities", body)
+        self.assertIn("Needs review", body)
+        self.assertIn("Completed metadata updates", body)
+        self.assertIn("Strava activity 901", body)
+        self.assertIn("Strava activity 123", body)
+
+    def test_pending_gear_is_retried_before_job_completes(self):
+        source = Activity(
+            name="Broken Ride",
+            id=10,
+            start_date="2026-08-13T07:00:00Z",
+            end_date="2026-08-13T08:00:00Z",
+            start_coords=(47.0, 8.0),
+            end_coords=(47.1, 8.1),
+            gear_id="bike-1",
+            sport="Ride",
+        )
+        replacement = CustomGPX()
+        track = gpxpy.gpx.GPXTrack()
+        segment = gpxpy.gpx.GPXTrackSegment()
+        segment.points.append(gpxpy.gpx.GPXTrackPoint(47.0, 8.0))
+        track.segments.append(segment)
+        replacement.tracks.append(track)
+        replacement.set_activity(_fixed_activity(source, 1))
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        store = JobStore(state_path)
+        job = store.add(
+            job_id="fix-10",
+            kind="fix",
+            source_activities=[source],
+            replacement=replacement,
+        )
+        job["status"] = "uploaded"
+        job["uploaded_activity_id"] = 901
+        job["replacement"]["id"] = 901
+        job["replacement"]["url"] = "https://www.strava.com/activities/901"
+        job["gear_update_pending"] = True
+        job["gear_update_error"] = "rate limit reached"
+        store.save()
+
+        class Merger:
+            google_maps_api_key = None
+
+            def __init__(self):
+                self.gear_updates = []
+                self.emails = []
+
+            def update_activity_gear(self, activity_id, gear_id):
+                self.gear_updates.append((activity_id, gear_id))
+                return True, None
+
+            @staticmethod
+            def activity_exists(activity_id):
+                return False
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+            def send_email(self, recipient, subject, body):
+                self.emails.append((recipient, subject, body))
+                return True
+
+        merger = Merger()
+        run_automation(
+            merger,
+            activities=[],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+
+        completed = JobStore(state_path).jobs["fix-10"]
+        self.assertEqual(completed["status"], "complete")
+        self.assertFalse(completed["gear_update_pending"])
+        self.assertEqual(merger.gear_updates, [(901, "bike-1")])
+        self.assertEqual(len(merger.emails), 1)
+        self.assertIn("Restored gear", merger.emails[0][2])
+
+    def test_awaiting_job_is_emailed_then_uploaded_on_next_run(self):
+        source = Activity(
+            name="Commute",
+            id=10,
+            start_date="2026-08-13T07:00:00Z",
+            end_date="2026-08-13T08:00:00Z",
+            start_coords=(47.0, 8.0),
+            end_coords=(47.1, 8.1),
+            gear_id="bike-1",
+            sport="Ride",
+        )
+        replacement = CustomGPX()
+        track = gpxpy.gpx.GPXTrack()
+        segment = gpxpy.gpx.GPXTrackSegment()
+        segment.points.append(gpxpy.gpx.GPXTrackPoint(47.0, 8.0))
+        track.segments.append(segment)
+        replacement.tracks.append(track)
+        replacement.set_activity(_fixed_activity(source, 1))
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        JobStore(state_path).add(
+            job_id="fix-10",
+            kind="fix",
+            source_activities=[source],
+            replacement=replacement,
+        )
+
+        class Merger:
+            google_maps_api_key = None
+
+            def __init__(self):
+                self.source_exists = True
+                self.uploads = []
+                self.emails = []
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+            @staticmethod
+            def fixed_activity_name(source, gpx):
+                return source.name
+
+            def activity_exists(self, activity_id):
+                return self.source_exists
+
+            def upload_activities_to_strava(self, gpxs):
+                self.uploads.extend(gpxs)
+                self.assert_source_gear(gpxs[0].activity.gear_id)
+                gpxs[0].activity.id = 901
+                gpxs[0].activity.url = "https://www.strava.com/activities/901"
+                return [
+                    UploadResult(
+                        gpx=gpxs[0],
+                        success=True,
+                        status="Your activity is ready.",
+                        activity_id=901,
+                        gear_applied=True,
+                    )
+                ]
+
+            @staticmethod
+            def assert_source_gear(gear_id):
+                if gear_id != "bike-1":
+                    raise AssertionError(f"unexpected gear {gear_id}")
+
+            def send_email(self, recipient, subject, body):
+                self.emails.append((recipient, subject, body))
+                return True
+
+        merger = Merger()
+        run_automation(
+            merger,
+            activities=[{"id": 10, "name": "Commute", "description": ""}],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+
+        self.assertEqual(len(merger.uploads), 0)
+        self.assertEqual(len(merger.emails), 1)
+        self.assertIn("Action required", merger.emails[0][2])
+
+        merger.source_exists = False
+        run_automation(
+            merger,
+            activities=[],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+        )
+
+        uploaded = JobStore(state_path).jobs["fix-10"]
+        self.assertEqual(uploaded["status"], "uploaded")
+        self.assertEqual(uploaded["uploaded_activity_id"], 901)
+        self.assertEqual(len(merger.uploads), 1)
+        self.assertEqual(len(merger.emails), 2)
+        self.assertIn("Uploaded replacements", merger.emails[1][2])
 
     def test_address_lookup_failure_falls_back_to_coordinates(self):
         class Geocoder:
@@ -563,7 +801,7 @@ class AutomationStateTests(unittest.TestCase):
 
         self.assertEqual(len(merger.emails), 1)
         self.assertEqual(
-            merger.emails[0][1], "StravaMerger - Delete source activities"
+            merger.emails[0][1], "StravaMerger - Daily report"
         )
 
     def test_duplicate_repair_resumes_after_source_deletion(self):
@@ -632,7 +870,7 @@ class AutomationStateTests(unittest.TestCase):
 
             def upload_activities_to_strava(self, gpxs):
                 self.upload_attempts += 1
-                if self.upload_attempts == 1:
+                if self.source_exists:
                     return [
                         UploadResult(
                             gpx=gpxs[0],
@@ -650,6 +888,7 @@ class AutomationStateTests(unittest.TestCase):
                         success=True,
                         status="Your activity is ready.",
                         activity_id=99,
+                        gear_applied=True,
                     )
                 ]
 
@@ -711,12 +950,14 @@ class AutomationStateTests(unittest.TestCase):
 
         self.assertEqual(first.repaired_jobs, 1)
         self.assertEqual(first.deferred_jobs, 1)
+        self.assertEqual(merger.upload_attempts, 0)
         job = JobStore(state_path).jobs["fix-10"]
         self.assertEqual(job["status"], "awaiting_deletion")
         self.assertIsNone(job["delete_notification_recipient"])
         self.assertIsNone(JobStore(state_path).review_reason(10))
         hole_detail = job["hole_details"]["10"][0]
         self.assertEqual(hole_detail["repair_method"], "straight_line")
+        self.assertEqual(hole_detail["travel_mode"], "BICYCLE")
         self.assertIn("more than 4x", hole_detail["fallback_reason"])
         hole_logs = [
             call
@@ -749,9 +990,9 @@ class AutomationStateTests(unittest.TestCase):
             state_path=state_path,
         )
         self.assertEqual(notified.deferred_jobs, 1)
-        self.assertEqual(merger.upload_attempts, 1)
+        self.assertEqual(merger.upload_attempts, 0)
         self.assertEqual(len(merger.emails), 1)
-        self.assertEqual(merger.emails[0][1], "StravaMerger - Delete source activities")
+        self.assertEqual(merger.emails[0][1], "StravaMerger - Daily report")
         self.assertIn("1.35 km", merger.emails[0][2])
         self.assertIn("Startstrasse 1, Zürich", merger.emails[0][2])
         self.assertIn("Zielweg 2, Zürich", merger.emails[0][2])
@@ -770,10 +1011,10 @@ class AutomationStateTests(unittest.TestCase):
             state_path=state_path,
         )
         self.assertEqual(reminded_again.deferred_jobs, 1)
-        self.assertEqual(merger.upload_attempts, 1)
+        self.assertEqual(merger.upload_attempts, 0)
         self.assertEqual(len(merger.emails), 2)
         self.assertEqual(
-            merger.emails[1][1], "StravaMerger - Delete source activities"
+            merger.emails[1][1], "StravaMerger - Daily report"
         )
 
         for filename in os.listdir(self.temporary_directory.name):
@@ -794,9 +1035,9 @@ class AutomationStateTests(unittest.TestCase):
             completed_job["confirmation_notification_recipient"],
             "me@example.com",
         )
-        self.assertEqual(merger.upload_attempts, 2)
+        self.assertEqual(merger.upload_attempts, 1)
         self.assertEqual(len(merger.emails), 3)
-        self.assertEqual(merger.emails[2][1], "StravaMerger - New activities")
+        self.assertEqual(merger.emails[2][1], "StravaMerger - Daily report")
         self.assertIn("Broken Ride", merger.emails[2][2])
 
 

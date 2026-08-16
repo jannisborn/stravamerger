@@ -30,6 +30,10 @@ GPXTPX_NAMESPACE = "http://www.garmin.com/xmlschemas/TrackPointExtension/v1"
 BOT_MARKER = "StravaMerger bot"
 
 
+def _bot_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 class StravaRateLimitError(RuntimeError):
     """Raised when Strava rejects a request because an API quota is exhausted."""
 
@@ -43,6 +47,8 @@ class UploadResult:
     status: str
     error: str | None = None
     activity_id: int | None = None
+    gear_applied: bool | None = None
+    gear_error: str | None = None
 
 
 class StravaMerger:
@@ -628,21 +634,25 @@ class StravaMerger:
                 name = f" {act.name} &"
         name = name[:-1]
         first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
-        chain_gear_ids = [gpx.activity.gear_id for gpx in gpx_list]
-        if chain_gear_ids and all(
-            gid and gid == chain_gear_ids[0] for gid in chain_gear_ids
-        ):
-            merged_gear_id = chain_gear_ids[0]
-        else:
-            merged_gear_id = None
+        chain_gear_ids = {
+            gpx.activity.gear_id for gpx in gpx_list if gpx.activity.gear_id
+        }
+        merged_gear_id = (
+            next(iter(chain_gear_ids)) if len(chain_gear_ids) == 1 else None
+        )
+        if len(chain_gear_ids) > 1:
+            logger.warning(
+                'Cannot preserve multiple different gears on merged activity "{}".',
+                name.strip(),
+            )
 
-        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         source_ids = tuple(gpx.activity.id for gpx in gpx_list)
         act = Activity(
             name=name,
             description=(
-                f"{BOT_MARKER} at {current_time}. Merged source activities: "
-                + ", ".join(str(source_id) for source_id in source_ids)
+                f"{BOT_MARKER} · merged activities "
+                + " + ".join(str(source_id) for source_id in source_ids)
+                + f" · {_bot_timestamp()}."
             ),
             id=-1,
             start_date=first_activity.start_date,
@@ -659,24 +669,26 @@ class StravaMerger:
         )
         return act
 
-    def update_activity_gear(self, activity_id: int, gear_id: str):
-        response = requests.put(
-            self.SINGLE_ACTIVITY_URL.format(activity_id),
-            headers={"Authorization": f"Bearer {self.access_token}"},
-            data={"gear_id": gear_id},
-            timeout=30,
-        )
+    def update_activity_gear(
+        self, activity_id: int, gear_id: str
+    ) -> tuple[bool, str | None]:
         try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-        self.check_rate_limit(payload)
-        if response.status_code >= 300:
-            logger.warning(
-                f"Could not set gear_id {gear_id} for activity {activity_id}: {response.text}"
+            response = requests.put(
+                self.SINGLE_ACTIVITY_URL.format(activity_id),
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"gear_id": gear_id},
+                timeout=30,
             )
-        else:
-            logger.info(f"Set gear_id {gear_id} for activity {activity_id}")
+            self.check_rate_limit(response)
+        except (requests.RequestException, StravaRateLimitError) as error:
+            logger.warning("Could not set gear: {}", error)
+            return False, str(error)
+        if response.status_code >= 300:
+            error = response.text or f"HTTP {response.status_code}"
+            logger.warning("Could not set gear: {}", error)
+            return False, error
+        logger.info("Set replacement activity gear.")
+        return True, None
 
     def save_activities(
         self,
@@ -942,13 +954,18 @@ class StravaMerger:
                 logger.info(f"Uploaded {i + 1}/{len(filedata)} to {url}")
                 gpx.activity.id = activity_id
                 gpx.activity.url = url
+                gear_applied = None
+                gear_error = None
                 if gpx.activity.gear_id:
                     try:
-                        self.update_activity_gear(activity_id, gpx.activity.gear_id)
+                        gear_applied, gear_error = self.update_activity_gear(
+                            activity_id, gpx.activity.gear_id
+                        )
                     except (requests.RequestException, StravaRateLimitError) as error:
+                        gear_applied = False
+                        gear_error = str(error)
                         logger.warning(
-                            "Uploaded activity {} but could not set its gear: {}",
-                            activity_id,
+                            "Uploaded replacement but could not set its gear: {}",
                             error,
                         )
                 results.append(
@@ -957,6 +974,8 @@ class StravaMerger:
                         success=True,
                         status=status,
                         activity_id=activity_id,
+                        gear_applied=gear_applied,
+                        gear_error=gear_error,
                     )
                 )
             else:

@@ -14,7 +14,10 @@ hole repair is a headless integration of the useful parts of
 ## Behavior
 
 Merge candidates must have the same sport, nearby endpoints, and normally the same
-local date. `--require-same-gear` additionally requires the same non-empty `gear_id`.
+local date. `--require-same-gear` additionally requires the same non-empty gear.
+Regardless of that flag, a repaired activity keeps its source gear and a merge keeps
+the one unambiguous gear used by its sources. If sources use different gears, Strava
+cannot represent both on one activity, so the daily report flags this and assigns none.
 
 With `--fix-holes`, an unchecked track has a hole when adjacent points exceed both:
 
@@ -32,10 +35,6 @@ direct gap over 20 km is rejected. If Google returns no usable route, or its rou
 over four times the direct gap, the replacement uses straight-line GPX coordinates at
 intervals of at most three seconds. The email says so; add `nomerge` instead of
 deleting the source if that repair is not acceptable.
-
-Repaired tracks keep their name unless it starts with `Fahrt am ...` or `Lauf am ...`.
-For those generic names, a matching location in `NAME_DICT` supplies a route name such
-as `IBM`.
 
 ## Fetching and persistent state
 
@@ -65,21 +64,27 @@ jobs are pending: it also contains saved upload and notification state.
 
 ## Replacement workflow and email
 
-Strava does not allow API deletion of activities. StravaMerger therefore:
+Strava does not allow API deletion of activities. The normal flow takes two cron runs:
 
-1. saves source and replacement GPX files in `--ofolder`;
-2. attempts the replacement upload and records the job;
-3. emails the current source-deletion checklist on every run while action remains;
-4. retries duplicate-rejected uploads after the source disappears and sends one
-   confirmation email after a successful upload.
+1. The first run prepares and persists the replacement, but does not upload it. The
+   daily report asks you to delete every source or add `nomerge`.
+2. After you delete the sources, the next run uploads the replacement, restores its
+   gear, and includes the Strava link in that run's report.
+
+Each run sends at most one `StravaMerger - Daily report`, combining uploads, pending
+deletions, generic-name reminders, metadata results, and manual-review warnings.
+Pending deletions are repeated daily. Replacement descriptions use minute-precision
+timestamps; repaired tracks add a concise gap distance and endpoint location.
 
 Deleted sources disappear from the next reminder. Add these case-insensitive markers
-to a Strava activity description:
+to a Strava activity's public description:
 
 - `nomerge`: skip merging and hole repair, and cancel a pending replacement;
 - `nofix`: skip hole repair.
 
 Activities created by StravaMerger are excluded automatically.
+Strava's API does not expose the private activity note, so markers placed there cannot
+be detected.
 
 ## Setup
 
