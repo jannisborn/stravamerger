@@ -456,6 +456,17 @@ class AutomationStateTests(unittest.TestCase):
         track.segments.append(segment)
         replacement.tracks.append(track)
         replacement.set_activity(_fixed_activity(source, 1))
+        source_path = os.path.join(
+            self.temporary_directory.name, "fix-10_source_10.gpx"
+        )
+        replacement_path = os.path.join(
+            self.temporary_directory.name, "fix-10_replacement.gpx"
+        )
+        for path in (source_path, replacement_path):
+            with open(path, "w") as file:
+                file.write(replacement.to_xml())
+        source.filepath = source_path
+        replacement.activity.filepath = replacement_path
         state_path = os.path.join(self.temporary_directory.name, "state.json")
         JobStore(state_path).add(
             job_id="fix-10",
@@ -519,6 +530,8 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(len(merger.uploads), 0)
         self.assertEqual(len(merger.emails), 1)
         self.assertIn("Action required", merger.emails[0][2])
+        self.assertTrue(os.path.exists(source_path))
+        self.assertTrue(os.path.exists(replacement_path))
 
         merger.source_exists = False
         run_automation(
@@ -535,6 +548,10 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(len(merger.uploads), 1)
         self.assertEqual(len(merger.emails), 2)
         self.assertIn("Uploaded replacements", merger.emails[1][2])
+        self.assertFalse(os.path.exists(source_path))
+        self.assertFalse(os.path.exists(replacement_path))
+        self.assertNotIn("replacement_gpx", uploaded)
+        self.assertEqual(uploaded["artifact_paths"], [])
 
     def test_address_lookup_failure_falls_back_to_coordinates(self):
         class Geocoder:
@@ -636,6 +653,11 @@ class AutomationStateTests(unittest.TestCase):
 
     def test_current_nomerge_marker_cancels_a_queued_fix(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")
+        artifact_path = os.path.join(
+            self.temporary_directory.name, "fix-10_replacement.gpx"
+        )
+        with open(artifact_path, "w") as file:
+            file.write("queued replacement")
         with open(state_path, "w") as file:
             json.dump(
                 {
@@ -646,6 +668,9 @@ class AutomationStateTests(unittest.TestCase):
                             "kind": "fix",
                             "source_ids": [10],
                             "sources": [{"id": 10, "name": "Old name"}],
+                            "replacement": {"filepath": artifact_path},
+                            "replacement_gpx": "queued replacement",
+                            "artifact_paths": [artifact_path],
                             "status": "awaiting_deletion",
                             "last_error": "duplicate of activity 10",
                         }
@@ -689,7 +714,14 @@ class AutomationStateTests(unittest.TestCase):
 
         job = JobStore(state_path).jobs["fix-10"]
         self.assertEqual(job["status"], "cancelled")
-        self.assertEqual(info.call_args.args[1], "Broken Ride")
+        cancellation_logs = [
+            call
+            for call in info.call_args_list
+            if call.args and call.args[0].startswith("Cancelled pending replacement")
+        ]
+        self.assertEqual(cancellation_logs[0].args[1], "Broken Ride")
+        self.assertFalse(os.path.exists(artifact_path))
+        self.assertNotIn("replacement_gpx", job)
 
     def test_file_only_job_is_marked_for_rebuild_without_opening_gpx(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")

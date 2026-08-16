@@ -120,6 +120,11 @@ class JobStore:
         )
         hole_distances_meters = hole_distances_meters or {}
         hole_details = hole_details or {}
+        artifact_paths = [
+            source.filepath for source in source_activities if source.filepath
+        ]
+        if replacement.activity.filepath:
+            artifact_paths.append(replacement.activity.filepath)
         job = {
             "id": job_id,
             "kind": kind,
@@ -138,6 +143,7 @@ class JobStore:
             },
             "replacement": replacement_data,
             "replacement_gpx": replacement.to_xml(),
+            "artifact_paths": list(dict.fromkeys(artifact_paths)),
             "status": "awaiting_deletion",
             "delete_notified": False,
             "delete_notification_recipient": None,
@@ -566,6 +572,7 @@ def _resume_jobs(
                 activity_name,
                 marker,
             )
+            _cleanup_job_artifacts(job)
             continue
         if (
             job["status"] in {"awaiting_deletion", "ready"}
@@ -590,6 +597,7 @@ def _resume_jobs(
                     "data is missing.",
                     source_names,
                 )
+                _cleanup_job_artifacts(job)
             else:
                 job["status"] = "manual_review"
                 job["last_error"] = (
@@ -601,6 +609,7 @@ def _resume_jobs(
                 )
             continue
         if job["status"] == "cancelled":
+            _cleanup_job_artifacts(job)
             continue
         if job["status"] == "manual_review":
             if job.get("upload_recovery_checked"):
@@ -619,6 +628,7 @@ def _resume_jobs(
                 job["replacement"]["name"],
             )
         if job["status"] in {"uploaded", "complete"}:
+            _cleanup_job_artifacts(job)
             if job.get("gear_update_pending"):
                 applied, error = merger.update_activity_gear(
                     job["uploaded_activity_id"],
@@ -971,6 +981,7 @@ def _mark_job_uploaded(
         job["gear_update_pending"] = not gear_applied
         job["gear_update_error"] = gear_error
     job["updated_at"] = _now()
+    _cleanup_job_artifacts(job)
 
 
 def _is_uploaded_replacement(
@@ -1038,6 +1049,64 @@ def _load_replacement(job: dict[str, Any]) -> CustomGPX:
     gpx.waypoints = parsed.waypoints
     gpx.set_activity(Activity(**job["replacement"]))
     return gpx
+
+
+def _cleanup_job_artifacts(job: dict[str, Any]) -> bool:
+    """Remove GPX data after a job no longer needs upload or recovery data."""
+    if job.get("artifacts_cleaned_at"):
+        return True
+
+    paths = {
+        os.path.abspath(path)
+        for path in job.get("artifact_paths", [])
+        if isinstance(path, str) and path.lower().endswith(".gpx")
+    }
+    replacement_path = job.get("replacement", {}).get("filepath")
+    if isinstance(replacement_path, str) and replacement_path.lower().endswith(
+        ".gpx"
+    ):
+        replacement_path = os.path.abspath(replacement_path)
+        paths.add(replacement_path)
+        folder = os.path.dirname(replacement_path)
+        safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", job["id"]).strip("._")
+        paths.update(
+            os.path.join(folder, f"{safe_prefix}_source_{source_id}.gpx")
+            for source_id in job.get("source_ids", [])
+        )
+
+    errors = []
+    deleted = 0
+    for path in sorted(paths):
+        try:
+            os.unlink(path)
+            deleted += 1
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(f"{path}: {error}")
+
+    if errors:
+        job["artifact_cleanup_error"] = "; ".join(errors)
+        logger.warning(
+            'Could not remove every GPX backup for "{}"; cleanup will retry.',
+            job.get("replacement", {}).get("name", "replacement"),
+        )
+        return False
+
+    job.pop("replacement_gpx", None)
+    job["artifact_paths"] = []
+    job.get("replacement", {})["filepath"] = None
+    for source in job.get("sources", []):
+        source["filepath"] = None
+    job.pop("artifact_cleanup_error", None)
+    job["artifacts_cleaned_at"] = _now()
+    if deleted:
+        logger.info(
+            'Removed {} GPX backup(s) for "{}".',
+            deleted,
+            job.get("replacement", {}).get("name", "replacement"),
+        )
+    return True
 
 
 def _route_with_fallback(

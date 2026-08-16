@@ -744,12 +744,15 @@ class StravaMerger:
         os.makedirs(folder, exist_ok=True)
         safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix).strip("._")
         for original in originals:
-            original_path = os.path.join(
-                folder,
-                f"{safe_prefix}_source_{original.activity.id}.gpx",
+            original_path = os.path.abspath(
+                os.path.join(
+                    folder,
+                    f"{safe_prefix}_source_{original.activity.id}.gpx",
+                )
             )
             with open(original_path, "w") as file:
                 file.write(original.to_xml())
+            original.activity.filepath = original_path
 
         replacement_path = os.path.abspath(
             os.path.join(folder, f"{safe_prefix}_replacement.gpx")
