@@ -5,7 +5,12 @@ import typer
 from loguru import logger
 
 from app import StravaMerger, StravaRateLimitError
-from automation import JobStore, prepare_oldest_activity_batch, run_automation
+from automation import (
+    MAX_HOLES_PER_ACTIVITY,
+    JobStore,
+    prepare_oldest_activity_batch,
+    run_automation,
+)
 from utils import DEFAULT_GENERIC_NAMES
 
 app = typer.Typer(no_args_is_help=True)
@@ -24,6 +29,7 @@ def run(
     hole_time_threshold: float,
     hole_distance_threshold: float,
     state_path: str | None,
+    max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
     generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
 ) -> None:
     merger = StravaMerger(
@@ -44,6 +50,7 @@ def run(
             merger,
             store,
             n_activities,
+            max_holes_per_activity=max_holes_per_activity,
         )
         summary = run_automation(
             merger,
@@ -54,6 +61,7 @@ def run(
             fix_holes=fix_holes,
             hole_time_threshold=hole_time_threshold,
             hole_distance_threshold=hole_distance_threshold,
+            max_holes_per_activity=max_holes_per_activity,
             scan_activity_ids=scan_activity_ids,
             generic_names=generic_names,
         )
@@ -136,7 +144,7 @@ def merge(
         help="Opt in to detecting and repairing GPS holes with Google Maps Routes.",
     ),
     hole_time_threshold: float = typer.Option(
-        5.0,
+        30.0,
         "--hole-time-threshold",
         help="Minimum time jump in seconds for a GPS hole.",
     ),
@@ -144,6 +152,12 @@ def merge(
         400.0,
         "--hole-distance-threshold",
         help="Minimum straight-line distance in meters for a GPS hole.",
+    ),
+    max_holes_per_activity: int = typer.Option(
+        MAX_HOLES_PER_ACTIVITY,
+        "--max-holes-per-activity",
+        min=1,
+        help="Maximum number of GPS holes repaired in one activity.",
     ),
     state_path: str | None = typer.Option(
         None,
@@ -174,6 +188,7 @@ def merge(
         hole_time_threshold=hole_time_threshold,
         hole_distance_threshold=hole_distance_threshold,
         state_path=state_path,
+        max_holes_per_activity=max_holes_per_activity,
         generic_names=generic_names or DEFAULT_GENERIC_NAMES,
     )
 
@@ -230,6 +245,12 @@ def run_cmd(
         "--hole-distance-threshold",
         help="Minimum straight-line distance in meters for a GPS hole.",
     ),
+    max_holes_per_activity: int = typer.Option(
+        MAX_HOLES_PER_ACTIVITY,
+        "--max-holes-per-activity",
+        min=1,
+        help="Maximum number of GPS holes repaired in one activity.",
+    ),
     state_path: str | None = typer.Option(
         None,
         "--state",
@@ -257,6 +278,7 @@ def run_cmd(
         hole_time_threshold=hole_time_threshold,
         hole_distance_threshold=hole_distance_threshold,
         state_path=state_path,
+        max_holes_per_activity=max_holes_per_activity,
         generic_names=generic_names or DEFAULT_GENERIC_NAMES,
     )
 

@@ -30,11 +30,12 @@ Hole endpoints are reverse geocoded for logs and email; coordinates are used if
 geocoding fails.
 
 Travel mode comes from the Strava sport: cycle sports use `BICYCLE`; runs, walks, and
-hikes use `WALK`; unsupported sports require manual review. More than five holes or a
-direct gap over 20 km is rejected. If Google returns no usable route, or its route is
-over four times the direct gap, the replacement uses straight-line GPX coordinates at
-intervals of at most three seconds. The email says so; add `nomerge` instead of
-deleting the source if that repair is not acceptable.
+hikes use `WALK`; unsupported sports require manual review. More than
+`--max-holes-per-activity` holes (default: 15), or a direct gap over 20 km, is rejected.
+If Google returns no usable route, or its route is over four times the direct gap, the
+replacement uses straight-line GPX coordinates at intervals of at most three seconds.
+The email says so; add `nomerge` instead of deleting the source if that repair is not
+acceptable.
 
 Generic titles are configured as case-insensitive glob patterns. The defaults are
 `Fahrt am *`, `Lauf am *`, and every combination of

@@ -42,7 +42,7 @@ from utils import (
     is_generic_activity_name,
 )
 
-MAX_HOLES_PER_ACTIVITY = 5
+MAX_HOLES_PER_ACTIVITY = 15
 READ_REQUEST_RESERVE = 10
 ACTIVITY_ID_PATTERN = re.compile(r"\b([Aa]ctivity) (\d+)\b")
 CATALOG_KEYS = (
@@ -159,6 +159,7 @@ class JobStore:
         activities: list[dict[str, Any]],
         *,
         initialize: bool = False,
+        max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
     ) -> int:
         """Refresh the compact oldest-first catalog and add unseen summaries."""
         scan = self.data["scan"]
@@ -180,7 +181,10 @@ class JobStore:
                 excluded.add(activity_id)
                 continue
             review = self.data["reviews"].get(key)
-            if review and not review.get("hole_details"):
+            if review and _review_needs_rescan(
+                review,
+                max_holes_per_activity=max_holes_per_activity,
+            ):
                 # Older state files kept only the review message. Requeue the
                 # activity once so the daily report can gain structured endpoints.
                 screened.discard(activity_id)
@@ -366,11 +370,17 @@ def prepare_oldest_activity_batch(
     merger: StravaMerger,
     store: JobStore,
     limit: int,
+    *,
+    max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
 ) -> tuple[list[dict[str, Any]], set[int]]:
     """Synchronize the catalog and select the oldest unseen daily batch."""
     catalog = merger.get_all_activities()
     if not store.scan_initialized:
-        added = store.sync_catalog(catalog, initialize=True)
+        added = store.sync_catalog(
+            catalog,
+            initialize=True,
+            max_holes_per_activity=max_holes_per_activity,
+        )
         logger.info(
             "Initialized oldest-first scan catalog with {} source activities; "
             "{} StravaMerger replacements excluded.",
@@ -378,7 +388,10 @@ def prepare_oldest_activity_batch(
             store.data["scan"].get("excluded_count", 0),
         )
     else:
-        added = store.sync_catalog(catalog)
+        added = store.sync_catalog(
+            catalog,
+            max_holes_per_activity=max_holes_per_activity,
+        )
         logger.info("Added {} newly seen activities to the scan catalog.", added)
     activities, scan_ids = store.oldest_batch(limit)
     if scan_ids:
@@ -415,12 +428,15 @@ def run_automation(
     fix_holes: bool = False,
     hole_time_threshold: float = 5.0,
     hole_distance_threshold: float = 400.0,
+    max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
     scan_activity_ids: set[int] | None = None,
     generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
 ) -> AutomationSummary:
     """Resume queued jobs, discover new replacements, and upload what is ready."""
     if hole_time_threshold < 0 or hole_distance_threshold < 0:
         raise ValueError("Hole detection thresholds cannot be negative.")
+    if max_holes_per_activity < 1:
+        raise ValueError("The maximum number of holes must be at least one.")
     store = JobStore(state_path)
     summary = AutomationSummary()
     scan_activity_ids = (
@@ -535,13 +551,22 @@ def run_automation(
         if previous_review:
             if (
                 previous_review_entry.get("hole_details")
-                and not _review_can_use_straight_line(previous_review)
+                and not _review_can_retry(
+                    previous_review_entry,
+                    max_holes_per_activity=max_holes_per_activity,
+                )
             ):
                 return None, []
             if _review_can_use_straight_line(previous_review):
                 logger.info(
                     'Retrying "{}" because straight-line fallback is now available.',
                     activity.name,
+                )
+            elif _review_is_too_many_holes(previous_review_entry):
+                logger.info(
+                    'Retrying "{}" because the configured limit now allows {} holes.',
+                    activity.name,
+                    len(previous_review_entry.get("hole_details") or []),
                 )
             else:
                 logger.info(
@@ -579,10 +604,10 @@ def run_automation(
             activity.name,
             hole_lines,
         )
-        if len(holes) > MAX_HOLES_PER_ACTIVITY:
+        if len(holes) > max_holes_per_activity:
             message = (
                 f"Activity {activity.id} ({activity.name}) has {len(holes)} holes, "
-                f"exceeding the automatic limit of {MAX_HOLES_PER_ACTIVITY}."
+                f"exceeding the automatic limit of {max_holes_per_activity}."
             )
             summary.review_messages.append(message)
             store.mark_for_review(
@@ -709,7 +734,11 @@ def run_automation(
             merger.activity_from_api(activity) for activity in detailed_activities
         ]
         if any(
-            _review_blocks_retry(store, activity.id)
+            _review_blocks_retry(
+                store,
+                activity.id,
+                max_holes_per_activity=max_holes_per_activity,
+            )
             and "nofix" not in activity.description.lower()
             for activity in chain
         ):
@@ -794,7 +823,11 @@ def run_automation(
                 and not merger.can_fix_activity(api_activity)
             )
             or store.was_checked_clean(activity_id)
-            or _review_blocks_retry(store, activity_id)
+            or _review_blocks_retry(
+                store,
+                activity_id,
+                max_holes_per_activity=max_holes_per_activity,
+            )
         ):
             summary.screened_activity_ids.add(activity_id)
             continue
@@ -1575,11 +1608,48 @@ def _review_can_use_straight_line(reason: str) -> bool:
     )
 
 
-def _review_blocks_retry(store: JobStore, activity_id: int) -> bool:
+def _review_is_too_many_holes(review: dict[str, Any]) -> bool:
+    return "exceeding the automatic limit" in review.get("reason", "")
+
+
+def _review_can_retry(
+    review: dict[str, Any],
+    *,
+    max_holes_per_activity: int,
+) -> bool:
+    hole_details = review.get("hole_details") or []
+    if not hole_details or _review_can_use_straight_line(review.get("reason", "")):
+        return True
+    return (
+        _review_is_too_many_holes(review)
+        and len(hole_details) <= max_holes_per_activity
+    )
+
+
+def _review_needs_rescan(
+    review: dict[str, Any],
+    *,
+    max_holes_per_activity: int,
+) -> bool:
+    return _review_can_retry(
+        review,
+        max_holes_per_activity=max_holes_per_activity,
+    )
+
+
+def _review_blocks_retry(
+    store: JobStore,
+    activity_id: int,
+    *,
+    max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
+) -> bool:
     review = store.data["reviews"].get(str(activity_id))
-    if not review or not review.get("hole_details"):
+    if not review:
         return False
-    return not _review_can_use_straight_line(review["reason"])
+    return not _review_can_retry(
+        review,
+        max_holes_per_activity=max_holes_per_activity,
+    )
 
 
 def _delete_mail_body(
@@ -1590,10 +1660,36 @@ def _delete_mail_body(
     return (
         "<html><body><p>These source activities are still awaiting action. Delete "
         "each activity in Strava to accept its prepared replacement, or add "
-        "<code>nomerge</code> to its description to cancel the replacement.</p><ul>"
-        + _delete_mail_items(jobs, existing_source_ids=existing_source_ids)
-        + "</ul></body></html>"
+        "<code>nomerge</code> to its description to cancel the replacement.</p>"
+        + _delete_mail_sections(jobs, existing_source_ids=existing_source_ids)
+        + "</body></html>"
     )
+
+
+def _delete_mail_sections(
+    jobs: list[dict[str, Any]],
+    *,
+    existing_source_ids: set[int] | None = None,
+) -> str:
+    sections = []
+    categories = (
+        (
+            "Activities with GPS holes",
+            [job for job in jobs if job["kind"] == "fix"],
+        ),
+        (
+            "Activities that can be merged",
+            [job for job in jobs if job["kind"] == "merge"],
+        ),
+    )
+    for heading, category_jobs in categories:
+        items = _delete_mail_items(
+            category_jobs,
+            existing_source_ids=existing_source_ids,
+        )
+        if items:
+            sections.append(f"<h3>{heading}</h3><ul>{items}</ul>")
+    return "".join(sections)
 
 
 def _delete_mail_items(
@@ -1626,7 +1722,8 @@ def _delete_mail_items(
             if hole_details:
                 label = "GPS hole" if len(hole_details) == 1 else "GPS holes"
                 body.append(
-                    f"<div>{len(hole_details)} {label} found:</div><ul>"
+                    f"<div><strong>{len(hole_details)} {label} found:</strong></div>"
+                    "<ul style='margin-top:0.25em'>"
                 )
                 body.extend(
                     f"<li>{_format_hole_detail_html(detail)}</li>"
@@ -1636,7 +1733,8 @@ def _delete_mail_items(
             elif distances:
                 label = "GPS hole" if len(distances) == 1 else "GPS holes"
                 body.append(
-                    f"<div>{len(distances)} {label} found:</div><ul>"
+                    f"<div><strong>{len(distances)} {label} found:</strong></div>"
+                    "<ul style='margin-top:0.25em'>"
                 )
                 body.extend(
                     f"<li><strong>{escape(_format_distance(distance))}</strong> "
@@ -1697,15 +1795,14 @@ def _daily_mail_body(
             "<h2>Action required: delete or opt out</h2>"
             "<p>Delete these source activities to accept their prepared replacement, "
             "or add <code>nomerge</code> to the public description to cancel it. "
-            "They remain here on every daily run until resolved.</p><ul>"
+            "They remain here on every daily run until resolved.</p>"
         )
         body.append(
-            _delete_mail_items(
+            _delete_mail_sections(
                 deletion_jobs,
                 existing_source_ids=existing_source_ids,
             )
         )
-        body.append("</ul>")
     if name_reminders:
         body.append("<h2>Rename generic activities</h2><ul>")
         for activity in name_reminders:
@@ -1729,7 +1826,8 @@ def _daily_mail_body(
             label = "GPS hole" if len(hole_details) == 1 else "GPS holes"
             body.append(
                 f"<li>{_link_activity_ids(review['reason'])}"
-                f"<div>{len(hole_details)} {label} found:</div><ul>"
+                f"<div><strong>{len(hole_details)} {label} found:</strong></div>"
+                "<ul style='margin-top:0.25em'>"
             )
             body.extend(
                 f"<li>{_format_hole_detail_html(detail)}</li>"
@@ -1810,7 +1908,8 @@ def _format_hole_detail_html(detail: dict[str, Any]) -> str:
     if detail.get("repair_method") == "straight_line":
         text += "<br><em>Straight-line GPX coordinates were used"
         if detail.get("fallback_reason"):
-            text += f" because {escape(detail['fallback_reason'])}"
+            reason = str(detail["fallback_reason"]).rstrip(".")
+            text += f" because {escape(reason)}"
         text += ".</em>"
     return text
 

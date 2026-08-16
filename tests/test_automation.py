@@ -11,6 +11,7 @@ import gpxpy.gpx
 
 from app import StravaMerger, StravaRateLimitError, UploadResult
 from automation import (
+    MAX_HOLES_PER_ACTIVITY,
     AutomationSummary,
     JobStore,
     _address_for,
@@ -95,12 +96,34 @@ class AutomationStateTests(unittest.TestCase):
         self.assertIn("1 GPS hole found", email_body)
         self.assertIn("1.50 km", email_body)
         self.assertIn("Start Street &rarr; End Street", email_body)
-        self.assertIn("<ul><li><strong>1.50 km</strong>", email_body)
+        self.assertIn("Activities with GPS holes", email_body)
+        self.assertIn(
+            "<ul style='margin-top:0.25em'><li><strong>1.50 km</strong>",
+            email_body,
+        )
         self.assertIn("Straight-line GPX coordinates were used", email_body)
         self.assertIn("Google Routes returned no route", email_body)
         self.assertIn(
             "href='https://www.strava.com/activities/123'>Strava activity 123</a>",
             email_body,
+        )
+        merge_body = _delete_mail_body(
+            [
+                loaded_store.jobs["fix-123"],
+                {
+                    "kind": "merge",
+                    "sources": [
+                        {"id": 456, "name": "Morning section"},
+                        {"id": 789, "name": "Afternoon section"},
+                    ],
+                },
+            ]
+        )
+        self.assertIn("Activities with GPS holes", merge_body)
+        self.assertIn("Activities that can be merged", merge_body)
+        self.assertLess(
+            merge_body.index("Activities with GPS holes"),
+            merge_body.index("Activities that can be merged"),
         )
 
     def test_oldest_catalog_advances_and_includes_backdated_new_uploads(self):
@@ -340,6 +363,90 @@ class AutomationStateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RouteError, "quota exceeded"):
             _route_with_fallback(ApiFailure(), hole, "BICYCLE")
+
+    def test_max_holes_is_configurable_and_defaults_to_fifteen(self):
+        self.assertEqual(MAX_HOLES_PER_ACTIVITY, 15)
+        api_activity = {
+            "id": 10,
+            "name": "Very broken ride",
+            "start_date": "2026-08-13T07:00:00Z",
+            "start_date_local": "2026-08-13T09:00:00Z",
+            "elapsed_time": 600,
+            "start_latlng": [47.0, 8.0],
+            "end_latlng": [47.1, 8.1],
+            "sport_type": "Ride",
+            "description": "",
+        }
+
+        class Merger:
+            google_maps_api_key = None
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                return []
+
+            can_fix_activity = staticmethod(StravaMerger.can_fix_activity)
+            activity_from_api = staticmethod(StravaMerger.activity_from_api)
+
+            @staticmethod
+            def activity_to_gpx(activity):
+                gpx = CustomGPX()
+                gpx.set_activity(activity)
+                return gpx
+
+            @staticmethod
+            def send_email(*args, **kwargs):
+                return True
+
+        holes = [
+            TrackHole(
+                track_index=0,
+                segment_index=0,
+                point_index=index,
+                elapsed_seconds=60,
+                distance_meters=500,
+                origin=(47.0, 8.0),
+                destination=(47.01, 8.01),
+            )
+            for index in range(16)
+        ]
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        with patch("automation.detect_holes", return_value=holes):
+            run_automation(
+                Merger(),
+                activities=[api_activity],
+                output_folder=self.temporary_directory.name,
+                recipient="me@example.com",
+                state_path=state_path,
+                fix_holes=True,
+            )
+
+        review = JobStore(state_path).data["reviews"]["10"]
+        self.assertIn("16 holes", review["reason"])
+        self.assertIn("limit of 15", review["reason"])
+        self.assertEqual(len(review["hole_details"]), 16)
+
+        with patch("automation.detect_holes", return_value=holes):
+            run_automation(
+                Merger(),
+                activities=[api_activity],
+                output_folder=self.temporary_directory.name,
+                recipient="me@example.com",
+                state_path=state_path,
+                fix_holes=True,
+                max_holes_per_activity=20,
+            )
+        self.assertNotIn("10", JobStore(state_path).data["reviews"])
+
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            run_automation(
+                Merger(),
+                activities=[],
+                output_folder=self.temporary_directory.name,
+                recipient="me@example.com",
+                state_path=state_path,
+                max_holes_per_activity=0,
+            )
 
     def test_fixed_activity_preserves_gear_and_has_concise_hole_description(self):
         source = Activity(
