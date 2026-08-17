@@ -36,7 +36,7 @@ from gpxfixer import (
     validate_route,
 )
 from utils import (
-    DEFAULT_GENERIC_NAMES,
+    DEFAULT_GENERIC_NAME_PATTERNS,
     Activity,
     CustomGPX,
     is_generic_activity_name,
@@ -255,10 +255,12 @@ class JobStore:
     def update_name_reminder(
         self,
         activity: dict[str, Any],
-        generic_names: Sequence[str],
+        generic_name_patterns: Sequence[str],
     ) -> None:
         key = str(activity["id"])
-        if is_generic_activity_name(activity.get("name") or "", generic_names):
+        if is_generic_activity_name(
+            activity.get("name") or "", generic_name_patterns
+        ):
             self.data["name_reminders"][key] = {
                 "id": activity["id"],
                 "name": activity["name"],
@@ -430,7 +432,7 @@ def run_automation(
     hole_distance_threshold: float = 400.0,
     max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
     scan_activity_ids: set[int] | None = None,
-    generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
+    generic_name_patterns: Sequence[str] = DEFAULT_GENERIC_NAME_PATTERNS,
 ) -> AutomationSummary:
     """Resume queued jobs, discover new replacements, and upload what is ready."""
     if hole_time_threshold < 0 or hole_distance_threshold < 0:
@@ -449,7 +451,7 @@ def run_automation(
     _refresh_name_reminders(
         merger,
         store,
-        generic_names=generic_names,
+        generic_name_patterns=generic_name_patterns,
         activities_by_id=activities_by_id,
         source_exists_cache=source_exists_cache,
     )
@@ -498,7 +500,7 @@ def run_automation(
             activities=activities,
             activities_by_id=activities_by_id,
             source_exists_cache=source_exists_cache,
-            generic_names=generic_names,
+            generic_name_patterns=generic_name_patterns,
         )
         raise
     merge_chains = [
@@ -710,7 +712,7 @@ def run_automation(
         ]
         for activity in detailed_activities:
             if activity is not None:
-                store.update_name_reminder(activity, generic_names)
+                store.update_name_reminder(activity, generic_name_patterns)
         if any(activity is None for activity in detailed_activities):
             merged_source_ids.difference_update(
                 activity.id for activity in chain
@@ -812,7 +814,7 @@ def run_automation(
         activity_id = api_activity["id"]
         if activity_id not in scan_activity_ids:
             continue
-        store.update_name_reminder(api_activity, generic_names)
+        store.update_name_reminder(api_activity, generic_name_patterns)
         if activity_id in merged_source_ids:
             continue
         if (
@@ -852,7 +854,7 @@ def run_automation(
             summary.screened_activity_ids.add(activity_id)
             store.remove_name_reminder(activity_id)
             continue
-        store.update_name_reminder(api_activity, generic_names)
+        store.update_name_reminder(api_activity, generic_name_patterns)
         if not merger.can_fix_activity(api_activity):
             summary.screened_activity_ids.add(activity_id)
             continue
@@ -904,7 +906,7 @@ def run_automation(
         activities=activities,
         activities_by_id=activities_by_id,
         source_exists_cache=source_exists_cache,
-        generic_names=generic_names,
+        generic_name_patterns=generic_name_patterns,
     )
     store.prune_terminal_jobs(recipient)
     store.save()
@@ -1127,7 +1129,7 @@ def _refresh_name_reminders(
     merger: StravaMerger,
     store: JobStore,
     *,
-    generic_names: Sequence[str],
+    generic_name_patterns: Sequence[str],
     activities_by_id: dict[int, dict[str, Any]],
     source_exists_cache: dict[int, bool],
 ) -> None:
@@ -1154,7 +1156,7 @@ def _refresh_name_reminders(
         if activity is None:
             store.remove_name_reminder(activity_id)
         else:
-            store.update_name_reminder(activity, generic_names)
+            store.update_name_reminder(activity, generic_name_patterns)
     store.save()
 
 
@@ -1262,7 +1264,7 @@ def _send_daily_report(
     activities: list[dict[str, Any]],
     activities_by_id: dict[int, dict[str, Any]],
     source_exists_cache: dict[int, bool],
-    generic_names: Sequence[str],
+    generic_name_patterns: Sequence[str],
 ) -> None:
     deletion_jobs, existing_source_ids = _outstanding_deletions(
         merger,
@@ -1312,12 +1314,12 @@ def _send_daily_report(
         if (
             replacement.get("id") not in known_reminder_ids
             and is_generic_activity_name(
-                replacement.get("name") or "", generic_names
+                replacement.get("name") or "", generic_name_patterns
             )
         ):
             name_reminders.append(replacement)
             known_reminder_ids.add(replacement["id"])
-            store.update_name_reminder(replacement, generic_names)
+            store.update_name_reminder(replacement, generic_name_patterns)
 
     if not any(
         (
@@ -1882,9 +1884,9 @@ def _append_hole_repair_summary(
 
 def _needs_name_change(
     name: str,
-    generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
+    generic_name_patterns: Sequence[str] = DEFAULT_GENERIC_NAME_PATTERNS,
 ) -> bool:
-    return is_generic_activity_name(name, generic_names)
+    return is_generic_activity_name(name, generic_name_patterns)
 
 
 def _format_hole_detail(detail: dict[str, Any]) -> str:

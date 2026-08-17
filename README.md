@@ -37,14 +37,20 @@ replacement uses straight-line GPX coordinates at intervals of at most three sec
 The email says so; add `nomerge` instead of deleting the source if that repair is not
 acceptable.
 
-Generic titles are configured as case-insensitive glob patterns. The defaults are
-`Fahrt am *`, `Lauf am *`, and every combination of
-`Morning|Afternoon|Evening` with `Run|Ride`. Repeat `--generic-name` to replace the
-default list, for example:
+Generic titles are configured as case-insensitive regular expressions which must match
+the complete title. The defaults cover Strava's five English periods—`Morning`,
+`Lunch`, `Afternoon`, `Evening`, and `Night`—and the corresponding German titles for
+runs and rides, including older compound forms such as `Mittagsradfahrt`, `Abendlauf`,
+and `Nachtradfahrt`. Repeat `--generic-name-pattern` to replace the default list, for
+example:
 
 ```console
---generic-name "Fahrt am *" --generic-name "Lunch Ride"
+--generic-name-pattern "(?:Fahrt|Lauf) am (?:Morgen|Mittag)" \
+--generic-name-pattern "Lunch (?:Ride|Run)"
 ```
+
+`--generic-name` remains an alias for compatibility, but its values are regular
+expressions as well.
 
 ## Fetching and persistent state
 

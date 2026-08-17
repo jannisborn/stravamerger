@@ -302,7 +302,7 @@ class AutomationStateTests(unittest.TestCase):
             output_folder=self.temporary_directory.name,
             recipient="me@example.com",
             state_path=state_path,
-            generic_names=("Lunch *",),
+            generic_name_patterns=(r"Lunch .*",),
         )
 
         self.assertEqual(first.screened_activity_ids, {10})
@@ -316,7 +316,7 @@ class AutomationStateTests(unittest.TestCase):
             output_folder=self.temporary_directory.name,
             recipient="me@example.com",
             state_path=state_path,
-            generic_names=("Lunch *",),
+            generic_name_patterns=(r"Lunch .*",),
         )
 
         self.assertNotIn("10", JobStore(state_path).data["name_reminders"])
@@ -639,14 +639,25 @@ class AutomationStateTests(unittest.TestCase):
         self.assertIn("Strava activity 901", merger.emails[0][2])
 
     def test_generic_activity_names_and_combined_report(self):
-        self.assertTrue(_needs_name_change("Fahrt am Morgen"))
-        self.assertTrue(_needs_name_change("Fahrt am"))
-        self.assertTrue(_needs_name_change("Lauf am Nachmittag"))
-        self.assertTrue(_needs_name_change("Morning Ride"))
-        self.assertTrue(_needs_name_change("Evening Run"))
+        for period in ("Morning", "Lunch", "Afternoon", "Evening", "Night"):
+            for activity_type in ("Ride", "Run"):
+                self.assertTrue(_needs_name_change(f"{period} {activity_type}"))
+        for activity_type in ("Fahrt", "Radfahrt", "Lauf"):
+            for period in ("Morgen", "Mittag", "Nachmittag", "Abend"):
+                self.assertTrue(
+                    _needs_name_change(f"{activity_type} am {period}")
+                )
+            self.assertTrue(_needs_name_change(f"{activity_type} in der Nacht"))
+        for period in ("Morgen", "Mittags", "Nachmittags", "Abend", "Nacht"):
+            for activity_type in ("radfahrt", "lauf"):
+                self.assertTrue(_needs_name_change(f"{period}{activity_type}"))
+
+        self.assertTrue(_needs_name_change("  morning ride "))
+        self.assertFalse(_needs_name_change("Fahrt am"))
+        self.assertFalse(_needs_name_change("Fahrt am See"))
         self.assertFalse(_needs_name_change("Morning gravel with friends"))
-        self.assertFalse(_needs_name_change("Lunch Ride"))
-        self.assertTrue(_needs_name_change("Lunch Ride", ("Lunch *",)))
+        self.assertTrue(_needs_name_change("Lunch Ride"))
+        self.assertTrue(_needs_name_change("Lunch Swim", (r"Lunch .*",)))
 
         body = _daily_mail_body(
             deletion_jobs=[],

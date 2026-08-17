@@ -19,7 +19,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from utils import (
-    DEFAULT_GENERIC_NAMES,
+    DEFAULT_GENERIC_NAME_PATTERNS,
     NAME_DICT,
     Activity,
     CustomGPX,
@@ -74,7 +74,7 @@ class StravaMerger:
         dist_theta: float = 1000.0,
         hour_theta: int = 6,
         require_same_gear: bool = False,
-        generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
+        generic_name_patterns: Sequence[str] = DEFAULT_GENERIC_NAME_PATTERNS,
     ):
         """
         Initializes the StravaMerger with the necessary credentials.
@@ -85,13 +85,14 @@ class StravaMerger:
             dist_theta: Distance threshold for merging activities.
             hour_theta: Maximal pausing between adjacent activities occuring on ADJACENT days.
             require_same_gear: If True, only merge activities with identical non-empty gear_id.
-            generic_names: Case-insensitive glob patterns that identify generic titles.
+            generic_name_patterns: Case-insensitive regular expressions that identify
+                generic titles. Each expression must match the complete title.
         """
 
         self.dist_theta = dist_theta
         self.hour_theta = hour_theta
         self.require_same_gear = require_same_gear
-        self.generic_names = tuple(generic_names)
+        self.generic_name_patterns = tuple(generic_name_patterns)
         self.sender_mail = sender_mail
         self.secret_path = os.path.abspath(secret_path)
 
@@ -347,7 +348,11 @@ class StravaMerger:
         """Choose the name for a repaired single-activity replacement."""
         if not is_generic_activity_name(
             activity.name,
-            getattr(self, "generic_names", DEFAULT_GENERIC_NAMES),
+            getattr(
+                self,
+                "generic_name_patterns",
+                DEFAULT_GENERIC_NAME_PATTERNS,
+            ),
         ):
             return activity.name
 
