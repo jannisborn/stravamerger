@@ -1,5 +1,7 @@
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from fnmatch import fnmatchcase
 from math import atan2, cos, radians, sin, sqrt
 
 import gpxpy.gpx
@@ -74,3 +76,32 @@ class CustomGPX(gpxpy.gpx.GPX):
 NAME_DICT = {
     (47.310019, 8.544049): "IBM",
 }
+
+DEFAULT_GENERIC_NAMES = (
+    "Fahrt am *",
+    "Lauf am *",
+    "Morning Run",
+    "Afternoon Run",
+    "Evening Run",
+    "Morning Ride",
+    "Afternoon Ride",
+    "Evening Ride",
+)
+
+
+def is_generic_activity_name(
+    name: str,
+    patterns: Sequence[str] = DEFAULT_GENERIC_NAMES,
+) -> bool:
+    """Return whether an activity title matches a configured case-insensitive glob."""
+    normalized = name.strip().casefold()
+    for pattern in patterns:
+        normalized_pattern = pattern.strip().casefold()
+        if fnmatchcase(normalized, normalized_pattern):
+            return True
+        if (
+            normalized_pattern.endswith(" *")
+            and normalized == normalized_pattern[:-2]
+        ):
+            return True
+    return False

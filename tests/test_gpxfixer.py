@@ -4,13 +4,17 @@ from datetime import datetime, timedelta, timezone
 import gpxpy.gpx
 
 from gpxfixer import (
+    GOOGLE_GEOCODING_URL,
     GOOGLE_ROUTES_URL,
+    GoogleGeocodingClient,
     GoogleRoutesClient,
+    NoRouteError,
     Route,
-    RouteError,
+    RouteTooIndirectError,
     decode_google_polyline,
     detect_holes,
     repair_holes,
+    straight_line_route,
     travel_mode_for_sport,
     validate_route,
 )
@@ -100,7 +104,7 @@ class GpxFixerTests(unittest.TestCase):
                 duration_seconds=100,
             ),
         )
-        with self.assertRaises(RouteError):
+        with self.assertRaises(RouteTooIndirectError):
             validate_route(
                 hole,
                 Route(
@@ -109,6 +113,32 @@ class GpxFixerTests(unittest.TestCase):
                     duration_seconds=100,
                 ),
             )
+
+    def test_straight_line_route_has_intermediate_coordinates(self):
+        hole = detect_holes(make_gpx())[0]
+
+        route = straight_line_route(hole)
+
+        self.assertEqual(route.points[0], hole.origin)
+        self.assertEqual(route.points[-1], hole.destination)
+        self.assertGreater(len(route.points), 3)
+        self.assertEqual(route.distance_meters, hole.distance_meters)
+        self.assertEqual(route.duration_seconds, hole.elapsed_seconds)
+        self.assertEqual(len(route.points), 41)
+        self.assertLessEqual(
+            hole.elapsed_seconds / (len(route.points) - 1),
+            3,
+        )
+        self.assertGreaterEqual(
+            hole.elapsed_seconds / (len(route.points) - 1),
+            2,
+        )
+        midpoint = route.points[len(route.points) // 2]
+        self.assertAlmostEqual(
+            (midpoint[0] - hole.origin[0]) / (hole.destination[0] - hole.origin[0]),
+            (midpoint[1] - hole.origin[1])
+            / (hole.destination[1] - hole.origin[1]),
+        )
 
     def test_conservative_sport_mode_mapping(self):
         self.assertEqual(travel_mode_for_sport("Ride"), "BICYCLE")
@@ -153,6 +183,55 @@ class GpxFixerTests(unittest.TestCase):
         self.assertEqual(session.kwargs["json"]["polylineQuality"], "HIGH_QUALITY")
         self.assertEqual(session.kwargs["headers"]["X-Goog-Api-Key"], "not-a-real-key")
         self.assertGreaterEqual(route.distance_meters, 1000)
+
+    def test_google_routes_client_distinguishes_no_route(self):
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"routes": []}
+
+        class Session:
+            @staticmethod
+            def post(*args, **kwargs):
+                return Response()
+
+        client = GoogleRoutesClient("not-a-real-key", session=Session())
+
+        with self.assertRaises(NoRouteError):
+            client.route((47.0, 8.0), (47.01, 8.01), "BICYCLE")
+
+    def test_google_reverse_geocoding_returns_formatted_address(self):
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "status": "OK",
+                    "results": [{"formatted_address": "Example Street 1, 8000 Zürich"}],
+                }
+
+        class Session:
+            def get(self, url, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return Response()
+
+        session = Session()
+        client = GoogleGeocodingClient("not-a-real-key", session=session)
+
+        address = client.reverse_geocode((47.3769, 8.5417))
+
+        self.assertEqual(address, "Example Street 1, 8000 Zürich")
+        self.assertEqual(session.url, GOOGLE_GEOCODING_URL)
+        self.assertEqual(session.kwargs["params"]["latlng"], "47.3769000,8.5417000")
+        self.assertEqual(session.kwargs["params"]["key"], "not-a-real-key")
 
 
 if __name__ == "__main__":

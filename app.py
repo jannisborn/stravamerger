@@ -5,6 +5,7 @@ import smtplib
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -18,16 +19,26 @@ from loguru import logger
 from tqdm import tqdm
 
 from utils import (
+    DEFAULT_GENERIC_NAMES,
     NAME_DICT,
     Activity,
     CustomGPX,
     haversine,
+    is_generic_activity_name,
     parse_date,
     parse_datetime,
 )
 
 GPXTPX_NAMESPACE = "http://www.garmin.com/xmlschemas/TrackPointExtension/v1"
 BOT_MARKER = "StravaMerger bot"
+
+
+def _bot_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+class StravaRateLimitError(RuntimeError):
+    """Raised when Strava rejects a request because an API quota is exhausted."""
 
 
 @dataclass
@@ -39,6 +50,8 @@ class UploadResult:
     status: str
     error: str | None = None
     activity_id: int | None = None
+    gear_applied: bool | None = None
+    gear_error: str | None = None
 
 
 class StravaMerger:
@@ -61,6 +74,7 @@ class StravaMerger:
         dist_theta: float = 1000.0,
         hour_theta: int = 6,
         require_same_gear: bool = False,
+        generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
     ):
         """
         Initializes the StravaMerger with the necessary credentials.
@@ -71,11 +85,13 @@ class StravaMerger:
             dist_theta: Distance threshold for merging activities.
             hour_theta: Maximal pausing between adjacent activities occuring on ADJACENT days.
             require_same_gear: If True, only merge activities with identical non-empty gear_id.
+            generic_names: Case-insensitive glob patterns that identify generic titles.
         """
 
         self.dist_theta = dist_theta
         self.hour_theta = hour_theta
         self.require_same_gear = require_same_gear
+        self.generic_names = tuple(generic_names)
         self.sender_mail = sender_mail
         self.secret_path = os.path.abspath(secret_path)
 
@@ -112,9 +128,10 @@ class StravaMerger:
         self.refresh_token = secret["refresh_token"]
         self.mail_password = secret.get("mail")
         self.google_maps_api_key = secret.get("google_maps_api_key")
+        self.read_rate_limit: tuple[int, int] | None = None
+        self.read_rate_usage: tuple[int, int] | None = None
 
-    @staticmethod
-    def check_rate_limit(response):
+    def check_rate_limit(self, response):
         """
         Raises if the rate limit has been exceeded.
 
@@ -122,8 +139,19 @@ class StravaMerger:
             response (requests.Response): The response from the Strava API.
         """
         if isinstance(response, requests.Response):
+            self._record_rate_limits(response)
             if response.status_code == 429:
-                raise ValueError("Rate Limit Exceeded")
+                usage = (
+                    f" Read usage: {self.read_rate_usage[0]}/"
+                    f"{self.read_rate_limit[0]} per 15 minutes and "
+                    f"{self.read_rate_usage[1]}/{self.read_rate_limit[1]} per day."
+                    if self.read_rate_limit and self.read_rate_usage
+                    else ""
+                )
+                raise StravaRateLimitError(
+                    "Strava API rate limit exceeded."
+                    f"{usage} Wait for the next 15-minute reset before retrying."
+                )
             try:
                 response = response.json()
             except ValueError:
@@ -132,7 +160,35 @@ class StravaMerger:
             isinstance(response, dict)
             and response.get("message") == "Rate Limit Exceeded"
         ):
-            raise ValueError("Rate Limit Exceeded")
+            raise StravaRateLimitError("Strava API rate limit exceeded.")
+
+    def _record_rate_limits(self, response: requests.Response) -> None:
+        def values(header: str) -> tuple[int, int] | None:
+            raw = response.headers.get(header)
+            if not raw:
+                return None
+            try:
+                short_term, daily = raw.split(",", maxsplit=1)
+                return int(short_term), int(daily)
+            except (TypeError, ValueError):
+                return None
+
+        read_rate_limit = values("X-ReadRateLimit-Limit")
+        read_rate_usage = values("X-ReadRateLimit-Usage")
+        if read_rate_limit is not None:
+            self.read_rate_limit = read_rate_limit
+        if read_rate_usage is not None:
+            self.read_rate_usage = read_rate_usage
+
+    def has_read_capacity(self, requests_needed: int, *, reserve: int = 10) -> bool:
+        """Return whether Strava reports enough read quota for optional work."""
+        if not self.read_rate_limit or not self.read_rate_usage:
+            return True
+        remaining = min(
+            limit - usage
+            for limit, usage in zip(self.read_rate_limit, self.read_rate_usage)
+        )
+        return remaining >= requests_needed + reserve
 
     def get_stream_url(self, activity_id: int) -> str:
         """
@@ -197,23 +253,30 @@ class StravaMerger:
             raise
 
     def get_activities(self, num_activities: int) -> list[dict[str, Any]]:
-        """
-        Retrieves a list of recent activities from Strava.
+        """Retrieve at most ``num_activities`` recent activity summaries."""
+        return self._get_activity_pages(num_activities)
 
-        Args:
-            num_activities (int): The number of recent activities to retrieve.
+    def get_all_activities(self) -> list[dict[str, Any]]:
+        """Retrieve the complete activity-summary catalog."""
+        return self._get_activity_pages(None)
 
-        Returns:
-            List[Dict[str, Any]]: A list of activities, each represented as a dictionary.
-        """
+    def _get_activity_pages(
+        self, num_activities: int | None
+    ) -> list[dict[str, Any]]:
+        """Retrieve paginated activity summaries, newest first."""
 
         activities = []
         header = {"Authorization": f"Bearer {self.access_token}"}
         page = 1
         with tqdm(total=num_activities, desc="Fetching Activities") as pbar:
-            while len(activities) < num_activities:
+            while num_activities is None or len(activities) < num_activities:
+                remaining = (
+                    200
+                    if num_activities is None
+                    else min(200, num_activities - len(activities))
+                )
                 params = {
-                    "per_page": min(200, num_activities - len(activities)),
+                    "per_page": remaining,
                     "page": page,
                 }
                 response = requests.get(
@@ -223,26 +286,13 @@ class StravaMerger:
                 response.raise_for_status()
                 page_activities = response.json()
                 fetched = len(page_activities)
-                pbar.update(min(fetched, num_activities - len(activities)))
+                pbar.update(fetched)
                 activities.extend(page_activities)
                 if fetched < params["per_page"]:
                     break
                 page += 1
 
-        for act in tqdm(activities, desc="Getting activity details"):
-            time.sleep(0.2)
-            detailed_resp = requests.get(
-                self.SINGLE_ACTIVITY_URL.format(act["id"]),
-                headers=header,
-                timeout=30,
-            )
-            self.check_rate_limit(detailed_resp)
-            detailed_resp.raise_for_status()
-            detailed_act = detailed_resp.json()
-            act.clear()
-            act.update(detailed_act)
-
-        return activities[:num_activities]
+        return activities if num_activities is None else activities[:num_activities]
 
     @staticmethod
     def get_end_date(start_date: str, duration: int) -> str:
@@ -273,7 +323,11 @@ class StravaMerger:
 
     @staticmethod
     def is_bot_activity(activity: dict[str, Any]) -> bool:
-        return BOT_MARKER.lower() in (activity.get("description") or "").lower()
+        description = (activity.get("description") or "").lower()
+        external_id = (activity.get("external_id") or "").lower()
+        return BOT_MARKER.lower() in description or external_id.startswith(
+            ("stravamerger-fix-", "stravamerger-merge-")
+        )
 
     @staticmethod
     def can_fix_activity(activity: dict[str, Any]) -> bool:
@@ -291,8 +345,10 @@ class StravaMerger:
         gpx: CustomGPX | None = None,
     ) -> str:
         """Choose the name for a repaired single-activity replacement."""
-        generic_name = activity.name.casefold().startswith(("fahrt am ", "lauf am "))
-        if not generic_name:
+        if not is_generic_activity_name(
+            activity.name,
+            getattr(self, "generic_names", DEFAULT_GENERIC_NAMES),
+        ):
             return activity.name
 
         def uses_location(location: tuple[float, float]) -> bool:
@@ -314,8 +370,8 @@ class StravaMerger:
                 return route_name
         return activity.name
 
-    def activity_exists(self, activity_id: int) -> bool:
-        """Check whether an owned activity still exists on Strava."""
+    def get_activity(self, activity_id: int) -> dict[str, Any] | None:
+        """Fetch an owned activity, returning ``None`` after it is deleted."""
         response = requests.get(
             self.SINGLE_ACTIVITY_URL.format(activity_id),
             headers={"Authorization": f"Bearer {self.access_token}"},
@@ -323,9 +379,13 @@ class StravaMerger:
         )
         self.check_rate_limit(response)
         if response.status_code == 404:
-            return False
+            return None
         response.raise_for_status()
-        return True
+        return response.json()
+
+    def activity_exists(self, activity_id: int) -> bool:
+        """Check whether an owned activity still exists on Strava."""
+        return self.get_activity(activity_id) is not None
 
     def detect_merging_activities(
         self, activities: list[dict[str, Any]]
@@ -350,7 +410,7 @@ class StravaMerger:
                 candidate_chains.append([activity_object])
                 continue
 
-            logger.debug('Considering activity "{}"', activity_object.name)
+            logger.trace('Considering activity "{}"', activity_object.name)
             match = False
             for candidate_chain in candidate_chains:
 
@@ -374,7 +434,7 @@ class StravaMerger:
                 gear_matches = same_gear or not self.require_same_gear
 
                 if same_day and same_type and gear_matches and dist < self.dist_theta:
-                    logger.info(
+                    logger.trace(
                         f"Match found: \n\tActivity {activity['name']} on {activity['start_date_local']} with {activity['id']}\n\t"
                         + f"Merge with activity {last_activity.name} on {last_activity.start_date} with {last_activity.id}"
                     )
@@ -589,21 +649,25 @@ class StravaMerger:
                 name = f" {act.name} &"
         name = name[:-1]
         first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
-        chain_gear_ids = [gpx.activity.gear_id for gpx in gpx_list]
-        if chain_gear_ids and all(
-            gid and gid == chain_gear_ids[0] for gid in chain_gear_ids
-        ):
-            merged_gear_id = chain_gear_ids[0]
-        else:
-            merged_gear_id = None
+        chain_gear_ids = {
+            gpx.activity.gear_id for gpx in gpx_list if gpx.activity.gear_id
+        }
+        merged_gear_id = (
+            next(iter(chain_gear_ids)) if len(chain_gear_ids) == 1 else None
+        )
+        if len(chain_gear_ids) > 1:
+            logger.warning(
+                'Cannot preserve multiple different gears on merged activity "{}".',
+                name.strip(),
+            )
 
-        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         source_ids = tuple(gpx.activity.id for gpx in gpx_list)
         act = Activity(
             name=name,
             description=(
-                f"{BOT_MARKER} at {current_time}. Merged source activities: "
-                + ", ".join(str(source_id) for source_id in source_ids)
+                f"{BOT_MARKER} · merged activities "
+                + " + ".join(str(source_id) for source_id in source_ids)
+                + f" · {_bot_timestamp()}."
             ),
             id=-1,
             start_date=first_activity.start_date,
@@ -620,24 +684,26 @@ class StravaMerger:
         )
         return act
 
-    def update_activity_gear(self, activity_id: int, gear_id: str):
-        response = requests.put(
-            self.SINGLE_ACTIVITY_URL.format(activity_id),
-            headers={"Authorization": f"Bearer {self.access_token}"},
-            data={"gear_id": gear_id},
-            timeout=30,
-        )
+    def update_activity_gear(
+        self, activity_id: int, gear_id: str
+    ) -> tuple[bool, str | None]:
         try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-        self.check_rate_limit(payload)
-        if response.status_code >= 300:
-            logger.warning(
-                f"Could not set gear_id {gear_id} for activity {activity_id}: {response.text}"
+            response = requests.put(
+                self.SINGLE_ACTIVITY_URL.format(activity_id),
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"gear_id": gear_id},
+                timeout=30,
             )
-        else:
-            logger.info(f"Set gear_id {gear_id} for activity {activity_id}")
+            self.check_rate_limit(response)
+        except (requests.RequestException, StravaRateLimitError) as error:
+            logger.warning("Could not set gear: {}", error)
+            return False, str(error)
+        if response.status_code >= 300:
+            error = response.text or f"HTTP {response.status_code}"
+            logger.warning("Could not set gear: {}", error)
+            return False, error
+        logger.info("Set replacement activity gear.")
+        return True, None
 
     def save_activities(
         self,
@@ -693,12 +759,15 @@ class StravaMerger:
         os.makedirs(folder, exist_ok=True)
         safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix).strip("._")
         for original in originals:
-            original_path = os.path.join(
-                folder,
-                f"{safe_prefix}_source_{original.activity.id}.gpx",
+            original_path = os.path.abspath(
+                os.path.join(
+                    folder,
+                    f"{safe_prefix}_source_{original.activity.id}.gpx",
+                )
             )
             with open(original_path, "w") as file:
                 file.write(original.to_xml())
+            original.activity.filepath = original_path
 
         replacement_path = os.path.abspath(
             os.path.join(folder, f"{safe_prefix}_replacement.gpx")
@@ -822,16 +891,11 @@ class StravaMerger:
         results = []
         for i, gpx in enumerate(filedata):
             filepath = gpx.activity.filepath
-            if not filepath or not os.path.exists(filepath):
-                results.append(
-                    UploadResult(
-                        gpx=gpx,
-                        success=False,
-                        status="missing_file",
-                        error=f"Replacement file does not exist: {filepath}",
-                    )
-                )
-                continue
+            filename = (
+                os.path.basename(filepath)
+                if filepath
+                else f"stravamerger-{i + 1}.gpx"
+            )
 
             data = {
                 "data_type": data_type,
@@ -843,18 +907,21 @@ class StravaMerger:
                 "external_id": gpx.activity.external_id,
             }
             try:
-                with open(filepath, "rb") as upload_file:
-                    response = requests.post(
-                        self.UPLOAD_URL,
-                        headers={"Authorization": f"Bearer {self.access_token}"},
-                        files={"file": upload_file},
-                        data={
-                            key: value
-                            for key, value in data.items()
-                            if value is not None
-                        },
-                        timeout=30,
-                    )
+                response = requests.post(
+                    self.UPLOAD_URL,
+                    headers={"Authorization": f"Bearer {self.access_token}"},
+                    files={
+                        "file": (
+                            filename,
+                            gpx.to_xml().encode("utf-8"),
+                            "application/gpx+xml",
+                        )
+                    },
+                    data={
+                        key: value for key, value in data.items() if value is not None
+                    },
+                    timeout=30,
+                )
                 self.check_rate_limit(response)
                 if response.status_code >= 300:
                     try:
@@ -905,14 +972,28 @@ class StravaMerger:
                 logger.info(f"Uploaded {i + 1}/{len(filedata)} to {url}")
                 gpx.activity.id = activity_id
                 gpx.activity.url = url
+                gear_applied = None
+                gear_error = None
                 if gpx.activity.gear_id:
-                    self.update_activity_gear(activity_id, gpx.activity.gear_id)
+                    try:
+                        gear_applied, gear_error = self.update_activity_gear(
+                            activity_id, gpx.activity.gear_id
+                        )
+                    except (requests.RequestException, StravaRateLimitError) as error:
+                        gear_applied = False
+                        gear_error = str(error)
+                        logger.warning(
+                            "Uploaded replacement but could not set its gear: {}",
+                            error,
+                        )
                 results.append(
                     UploadResult(
                         gpx=gpx,
                         success=True,
                         status=status,
                         activity_id=activity_id,
+                        gear_applied=gear_applied,
+                        gear_error=gear_error,
                     )
                 )
             else:

@@ -7,6 +7,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from itertools import pairwise
+from math import ceil
 
 import gpxpy.gpx
 import requests
@@ -14,6 +15,7 @@ import requests
 from utils import CustomGPX, haversine
 
 GOOGLE_ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+GOOGLE_GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 
 BICYCLE_SPORTS = {
     "EBikeRide",
@@ -34,10 +36,23 @@ WALK_SPORTS = {
 SUPPORTED_TRAVEL_MODES = {"BICYCLE", "DRIVE", "TWO_WHEELER", "WALK"}
 MAX_HOLE_DISTANCE = 20_000.0
 MAX_ROUTE_FACTOR = 4.0
+MAX_STRAIGHT_LINE_POINT_INTERVAL_SECONDS = 3.0
 
 
 class RouteError(RuntimeError):
     """Raised when a missing track section cannot be routed safely."""
+
+
+class NoRouteError(RouteError):
+    """Raised when Google returns no usable route geometry."""
+
+
+class RouteTooIndirectError(RouteError):
+    """Raised when a Google route is implausibly longer than the direct gap."""
+
+
+class GeocodingError(RuntimeError):
+    """Raised when a coordinate cannot be reverse geocoded."""
 
 
 @dataclass(frozen=True)
@@ -203,11 +218,11 @@ class GoogleRoutesClient:
         except ValueError as error:
             raise RouteError("Google Routes returned invalid JSON.") from error
         if not body.get("routes"):
-            raise RouteError("Google Routes returned no route.")
+            raise NoRouteError("Google Routes returned no route.")
         route = body["routes"][0]
         encoded = route.get("polyline", {}).get("encodedPolyline")
         if not encoded:
-            raise RouteError("Google Routes returned no route geometry.")
+            raise NoRouteError("Google Routes returned no route geometry.")
 
         decoded = decode_google_polyline(encoded)
         points = _with_exact_endpoints(tuple(origin), tuple(destination), decoded)
@@ -221,6 +236,55 @@ class GoogleRoutesClient:
         )
 
 
+class GoogleGeocodingClient:
+    """Small client for Google Maps Geocoding API reverse lookups."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        timeout: float = 30.0,
+        session: requests.Session | None = None,
+    ) -> None:
+        if not api_key:
+            raise ValueError("A Google Maps API key is required for address lookup.")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.session = session or requests.Session()
+
+    def reverse_geocode(self, location: Sequence[float]) -> str | None:
+        """Return Google's closest formatted address, or ``None`` if none exists."""
+        latitude, longitude = map(float, location)
+        try:
+            response = self.session.get(
+                GOOGLE_GEOCODING_URL,
+                params={
+                    "latlng": f"{latitude:.7f},{longitude:.7f}",
+                    "key": self.api_key,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as error:
+            raise GeocodingError(
+                f"Google reverse-geocoding request failed: {error}"
+            ) from error
+
+        try:
+            body = response.json()
+        except ValueError as error:
+            raise GeocodingError("Google Geocoding returned invalid JSON.") from error
+        status = body.get("status")
+        if status == "ZERO_RESULTS":
+            return None
+        if status != "OK":
+            detail = body.get("error_message") or status or "unknown error"
+            raise GeocodingError(f"Google reverse geocoding failed: {detail}")
+        results = body.get("results") or []
+        address = results[0].get("formatted_address") if results else None
+        return address or None
+
+
 def validate_route(
     hole: TrackHole,
     route: Route,
@@ -232,12 +296,33 @@ def validate_route(
             f"{MAX_HOLE_DISTANCE:.0f} m safety limit."
         )
     if route.distance_meters > hole.distance_meters * MAX_ROUTE_FACTOR:
-        raise RouteError(
+        raise RouteTooIndirectError(
             f"{route.distance_meters:.0f} m route is more than {MAX_ROUTE_FACTOR:g}x "
             f"the {hole.distance_meters:.0f} m straight-line gap."
         )
     if len(route.points) < 3:
-        raise RouteError("The route contains no points between the gap endpoints.")
+        raise NoRouteError("The route contains no points between the gap endpoints.")
+
+
+def straight_line_route(hole: TrackHole) -> Route:
+    """Create direct-line coordinates at intervals of at most three seconds."""
+    steps = max(
+        2, ceil(hole.elapsed_seconds / MAX_STRAIGHT_LINE_POINT_INTERVAL_SECONDS)
+    )
+    latitude_delta = hole.destination[0] - hole.origin[0]
+    longitude_delta = hole.destination[1] - hole.origin[1]
+    points = tuple(
+        (
+            hole.origin[0] + latitude_delta * step / steps,
+            hole.origin[1] + longitude_delta * step / steps,
+        )
+        for step in range(steps + 1)
+    )
+    return Route(
+        points=points,
+        distance_meters=hole.distance_meters,
+        duration_seconds=hole.elapsed_seconds,
+    )
 
 
 def repair_holes(
