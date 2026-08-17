@@ -15,6 +15,7 @@ from automation import (
     AutomationSummary,
     JobStore,
     _address_for,
+    _auto_rename_activity,
     _daily_mail_body,
     _delete_mail_body,
     _fixed_activity,
@@ -321,6 +322,52 @@ class AutomationStateTests(unittest.TestCase):
 
         self.assertNotIn("10", JobStore(state_path).data["name_reminders"])
         self.assertEqual(len(merger.emails), 1)
+
+    def test_matching_generic_activity_is_renamed_and_removed_from_reminders(self):
+        class Merger:
+            def __init__(self):
+                self.updates = []
+
+            @staticmethod
+            def activity_name_for_track(activity, gpx):
+                return "Zurich Pendeln"
+
+            def update_activity_name(self, activity_id, name):
+                self.updates.append((activity_id, name))
+                return True, None
+
+        state_path = os.path.join(self.temporary_directory.name, "state.json")
+        store = JobStore(state_path)
+        activity = {"id": 10, "name": "Radfahrt am Morgen"}
+        store.update_name_reminder(activity, (r"Radfahrt am Morgen",))
+        gpx = CustomGPX()
+        gpx.set_activity(
+            Activity(
+                name=activity["name"],
+                id=10,
+                start_date="2026-08-13T07:00:00Z",
+                end_date="2026-08-13T08:00:00Z",
+                start_coords=(47.4, 8.4),
+                end_coords=(47.5, 8.5),
+                sport="Ride",
+            )
+        )
+        summary = AutomationSummary()
+        merger = Merger()
+
+        renamed = _auto_rename_activity(
+            merger,
+            store,
+            activity,
+            gpx,
+            summary,
+        )
+
+        self.assertTrue(renamed)
+        self.assertEqual(merger.updates, [(10, "Zurich Pendeln")])
+        self.assertEqual(activity["name"], "Zurich Pendeln")
+        self.assertNotIn("10", store.data["name_reminders"])
+        self.assertIn('Renamed "Radfahrt am Morgen"', summary.info_messages[0])
 
     def test_routing_fallback_is_limited_to_no_route_or_indirect_route(self):
         hole = TrackHole(
@@ -673,7 +720,7 @@ class AutomationStateTests(unittest.TestCase):
             ],
             review_messages=["Activity 456 needs review"],
             name_reminders=[{"id": 123, "name": "Morning Ride"}],
-            info_messages=["Restored gear on replacement."],
+            info_messages=["Restored gear on Activity 42."],
         )
 
         self.assertIn("Uploaded replacements", body)
@@ -682,6 +729,7 @@ class AutomationStateTests(unittest.TestCase):
         self.assertIn("Completed metadata updates", body)
         self.assertIn("Strava activity 901", body)
         self.assertIn("Strava activity 123", body)
+        self.assertIn("https://www.strava.com/activities/42", body)
 
         review_body = _daily_mail_body(
             deletion_jobs=[],

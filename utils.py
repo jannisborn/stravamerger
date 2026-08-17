@@ -77,6 +77,12 @@ NAME_DICT = {
     (47.310019, 8.544049): "IBM",
 }
 
+ADDRESS_NAME_DICT = {
+    "Langgrabenstrasse 32, 8105 Watt, Switzerland": "Zurich Pendeln",
+}
+
+NAME_MATCH_RADIUS_METERS = 150.0
+
 DEFAULT_GENERIC_NAME_PATTERNS = (
     r"(?:Morning|Lunch|Afternoon|Evening|Night) (?:Ride|Run)",
     r"(?:Fahrt|Radfahrt|Lauf) am (?:Morgen|Mittag|Nachmittag|Abend)",

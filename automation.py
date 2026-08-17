@@ -36,6 +36,7 @@ from gpxfixer import (
     validate_route,
 )
 from utils import (
+    ADDRESS_NAME_DICT,
     DEFAULT_GENERIC_NAME_PATTERNS,
     Activity,
     CustomGPX,
@@ -88,6 +89,7 @@ class JobStore:
             self.data = loaded
         self.data.setdefault("checks", {})
         self.data.setdefault("reviews", {})
+        self.data.setdefault("name_locations", {})
         self.data.setdefault("name_reminders", {})
         scan = self.data.setdefault(
             "scan",
@@ -261,13 +263,24 @@ class JobStore:
         if is_generic_activity_name(
             activity.get("name") or "", generic_name_patterns
         ):
-            self.data["name_reminders"][key] = {
+            previous = self.data["name_reminders"].get(key, {})
+            reminder = {
                 "id": activity["id"],
                 "name": activity["name"],
                 "url": activity.get("url"),
             }
+            if previous.get("name") == activity["name"] and previous.get(
+                "auto_match_version"
+            ):
+                reminder["auto_match_version"] = previous["auto_match_version"]
+            self.data["name_reminders"][key] = reminder
         else:
             self.data["name_reminders"].pop(key, None)
+
+    def mark_name_match_checked(self, activity_id: int, version: str) -> None:
+        reminder = self.data["name_reminders"].get(str(activity_id))
+        if reminder is not None:
+            reminder["auto_match_version"] = version
 
     def remove_name_reminder(self, activity_id: int) -> None:
         self.data["name_reminders"].pop(str(activity_id), None)
@@ -441,6 +454,7 @@ def run_automation(
         raise ValueError("The maximum number of holes must be at least one.")
     store = JobStore(state_path)
     summary = AutomationSummary()
+    _configure_activity_name_locations(merger, store)
     scan_activity_ids = (
         {activity["id"] for activity in activities}
         if scan_activity_ids is None
@@ -451,6 +465,7 @@ def run_automation(
     _refresh_name_reminders(
         merger,
         store,
+        summary=summary,
         generic_name_patterns=generic_name_patterns,
         activities_by_id=activities_by_id,
         source_exists_cache=source_exists_cache,
@@ -820,10 +835,6 @@ def run_automation(
         if (
             not api_activity.get("start_latlng")
             or StravaMerger.is_bot_activity(api_activity)
-            or (
-                "description" in api_activity
-                and not merger.can_fix_activity(api_activity)
-            )
             or store.was_checked_clean(activity_id)
             or _review_blocks_retry(
                 store,
@@ -833,7 +844,10 @@ def run_automation(
         ):
             summary.screened_activity_ids.add(activity_id)
             continue
-        if not fix_holes:
+        should_match_name = is_generic_activity_name(
+            api_activity.get("name") or "", generic_name_patterns
+        )
+        if not fix_holes and not should_match_name:
             summary.screened_activity_ids.add(activity_id)
             continue
         requests_needed = 1 + _activity_detail_request_needed(
@@ -855,11 +869,30 @@ def run_automation(
             store.remove_name_reminder(activity_id)
             continue
         store.update_name_reminder(api_activity, generic_name_patterns)
-        if not merger.can_fix_activity(api_activity):
+        should_match_name = (
+            is_generic_activity_name(
+                api_activity.get("name") or "", generic_name_patterns
+            )
+            and "nomerge"
+            not in (api_activity.get("description") or "").lower()
+        )
+        can_fix = merger.can_fix_activity(api_activity)
+        if not should_match_name and (not fix_holes or not can_fix):
             summary.screened_activity_ids.add(activity_id)
             continue
         source = merger.activity_from_api(api_activity)
         original = fetch(source)
+        if should_match_name:
+            _auto_rename_activity(
+                merger,
+                store,
+                api_activity,
+                original,
+                summary,
+            )
+        if not fix_holes or not can_fix:
+            summary.screened_activity_ids.add(activity_id)
+            continue
         repaired, hole_details = repair(original)
         if repaired is None:
             if store.review_reason(source.id):
@@ -1125,10 +1158,110 @@ def _get_detailed_activity(
     return activity
 
 
+def _configure_activity_name_locations(
+    merger: StravaMerger,
+    store: JobStore,
+) -> None:
+    """Resolve configured address rules and add them to the coordinate matcher."""
+    add_location = getattr(merger, "add_activity_name_location", None)
+    if not ADDRESS_NAME_DICT or not callable(add_location):
+        return
+    merger.activity_name_rules_complete = False
+    cache = store.data["name_locations"]
+    unresolved = []
+    for address, activity_name in ADDRESS_NAME_DICT.items():
+        cached = cache.get(address)
+        if cached and cached.get("name") == activity_name:
+            add_location(
+                (cached["latitude"], cached["longitude"]),
+                activity_name,
+            )
+        else:
+            unresolved.append((address, activity_name))
+    if unresolved and not merger.google_maps_api_key:
+        message = "Address-based activity naming requires a Google Maps API key."
+        logger.warning(message)
+        return
+    client = (
+        GoogleGeocodingClient(merger.google_maps_api_key)
+        if unresolved
+        else None
+    )
+    cache_changed = False
+    for address, activity_name in unresolved:
+        try:
+            location = client.geocode(address)
+        except GeocodingError as error:
+            message = f'Could not resolve naming address "{address}": {error}'
+            logger.warning(message)
+            continue
+        if location is None:
+            message = f'Could not resolve naming address "{address}".'
+            logger.warning(message)
+            continue
+        add_location(location, activity_name)
+        cache[address] = {
+            "latitude": location[0],
+            "longitude": location[1],
+            "name": activity_name,
+        }
+        cache_changed = True
+    if cache_changed:
+        store.save()
+    merger.activity_name_rules_complete = all(
+        activity_name in merger.activity_name_locations.values()
+        for activity_name in ADDRESS_NAME_DICT.values()
+    )
+
+
+def _auto_rename_activity(
+    merger: StravaMerger,
+    store: JobStore,
+    activity: dict[str, Any],
+    gpx: CustomGPX,
+    summary: AutomationSummary,
+) -> bool:
+    """Rename one generic activity when its track touches a configured location."""
+    source = gpx.activity
+    new_name = merger.activity_name_for_track(source, gpx)
+    if not new_name:
+        if getattr(merger, "activity_name_rules_complete", True):
+            store.mark_name_match_checked(
+                source.id,
+                merger.activity_name_rule_version(),
+            )
+            store.save()
+        return False
+    if new_name == source.name:
+        return False
+    old_name = source.name
+    applied, error = merger.update_activity_name(source.id, new_name)
+    if not applied:
+        summary.review_messages.append(
+            f'Could not rename Activity {source.id} from "{old_name}" to '
+            f'"{new_name}": {error or "unknown error"}'
+        )
+        return False
+    source.name = new_name
+    activity["name"] = new_name
+    store.remove_name_reminder(source.id)
+    store.save()
+    summary.info_messages.append(
+        f'Renamed "{old_name}" to "{new_name}" (Activity {source.id}).'
+    )
+    logger.info(
+        'Renamed "{}" to "{}".',
+        old_name,
+        new_name,
+    )
+    return True
+
+
 def _refresh_name_reminders(
     merger: StravaMerger,
     store: JobStore,
     *,
+    summary: AutomationSummary,
     generic_name_patterns: Sequence[str],
     activities_by_id: dict[int, dict[str, Any]],
     source_exists_cache: dict[int, bool],
@@ -1146,6 +1279,7 @@ def _refresh_name_reminders(
                     "Could not refresh all generic-name reminders without using "
                     "the reserved read quota."
                 )
+                store.save()
                 return
             activity = _get_detailed_activity(
                 merger,
@@ -1157,6 +1291,35 @@ def _refresh_name_reminders(
             store.remove_name_reminder(activity_id)
         else:
             store.update_name_reminder(activity, generic_name_patterns)
+            reminder = store.data["name_reminders"].get(str(activity_id), {})
+            rule_version = getattr(merger, "activity_name_rule_version", None)
+            can_auto_rename = all(
+                callable(getattr(merger, method, None))
+                for method in (
+                    "activity_from_api",
+                    "activity_to_gpx",
+                    "activity_name_for_track",
+                    "update_activity_name",
+                )
+            ) and callable(rule_version)
+            if (
+                can_auto_rename
+                and is_generic_activity_name(
+                    activity.get("name") or "", generic_name_patterns
+                )
+                and "nomerge" not in (activity.get("description") or "").lower()
+                and reminder.get("auto_match_version") != rule_version()
+            ):
+                if not _has_read_capacity(merger, 1):
+                    logger.warning(
+                        "Could not match all generic-name reminders without using "
+                        "the reserved read quota."
+                    )
+                    store.save()
+                    return
+                source = merger.activity_from_api(activity)
+                gpx = merger.activity_to_gpx(source)
+                _auto_rename_activity(merger, store, activity, gpx, summary)
     store.save()
 
 
@@ -1819,7 +1982,10 @@ def _daily_mail_body(
         body.append("</ul>")
     if info_messages:
         body.append("<h2>Completed metadata updates</h2><ul>")
-        body.extend(f"<li>{escape(message)}</li>" for message in info_messages)
+        body.extend(
+            f"<li>{_link_activity_ids(message)}</li>"
+            for message in info_messages
+        )
         body.append("</ul>")
     if review_messages or review_items:
         body.append("<h2>Needs review</h2><ul>")

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from tqdm import tqdm
 
 from utils import (
     DEFAULT_GENERIC_NAME_PATTERNS,
+    NAME_MATCH_RADIUS_METERS,
     NAME_DICT,
     Activity,
     CustomGPX,
@@ -93,6 +95,8 @@ class StravaMerger:
         self.hour_theta = hour_theta
         self.require_same_gear = require_same_gear
         self.generic_name_patterns = tuple(generic_name_patterns)
+        self.activity_name_locations = dict(NAME_DICT)
+        self.activity_name_rules_complete = True
         self.sender_mail = sender_mail
         self.secret_path = os.path.abspath(secret_path)
 
@@ -346,34 +350,57 @@ class StravaMerger:
         gpx: CustomGPX | None = None,
     ) -> str:
         """Choose the name for a repaired single-activity replacement."""
+        matcher = getattr(self, "activity_name_for_track", None)
+        if not callable(matcher):
+            return activity.name
+        return matcher(activity, gpx) or activity.name
+
+    def add_activity_name_location(
+        self,
+        location: tuple[float, float],
+        activity_name: str,
+    ) -> None:
+        """Register a coordinate which gives generic activities a specific name."""
+        self.activity_name_locations[tuple(map(float, location))] = activity_name
+
+    def activity_name_rule_version(self) -> str:
+        """Return a compact fingerprint which changes with the location rules."""
+        rules = repr(tuple(self.activity_name_locations.items())).encode("utf-8")
+        return hashlib.sha256(rules).hexdigest()
+
+    def activity_name_for_track(
+        self,
+        activity: Activity,
+        gpx: CustomGPX | None = None,
+    ) -> str | None:
+        """Return the first configured name touched by a generic activity."""
         if not is_generic_activity_name(
             activity.name,
-            getattr(
-                self,
-                "generic_name_patterns",
-                DEFAULT_GENERIC_NAME_PATTERNS,
-            ),
+            self.generic_name_patterns,
         ):
-            return activity.name
+            return None
 
         def uses_location(location: tuple[float, float]) -> bool:
-            if activity.start_coords and (
-                haversine(location, activity.start_coords) < self.dist_theta
+            if any(
+                endpoint
+                and haversine(location, endpoint) <= NAME_MATCH_RADIUS_METERS
+                for endpoint in (activity.start_coords, activity.end_coords)
             ):
                 return True
             if gpx is None:
                 return False
             return any(
-                haversine(location, (point.latitude, point.longitude)) < self.dist_theta
+                haversine(location, (point.latitude, point.longitude))
+                <= NAME_MATCH_RADIUS_METERS
                 for track in gpx.tracks
                 for segment in track.segments
                 for point in segment.points
             )
 
-        for location, route_name in NAME_DICT.items():
+        for location, configured_name in self.activity_name_locations.items():
             if uses_location(location):
-                return route_name
-        return activity.name
+                return configured_name
+        return None
 
     def get_activity(self, activity_id: int) -> dict[str, Any] | None:
         """Fetch an owned activity, returning ``None`` after it is deleted."""
@@ -643,16 +670,10 @@ class StravaMerger:
 
     def get_new_activity(self, gpx_list: list[CustomGPX]) -> Activity:
         """Returns a list of new activities to be uploaded to Strava."""
-        name = ""
-        for gpx in gpx_list:
-            act = gpx.activity
-            for loc, tname in NAME_DICT.items():
-                if haversine(loc, act.start_coords) < self.dist_theta:
-                    name = tname + "&"
-                    break
-            else:
-                name = f" {act.name} &"
-        name = name[:-1]
+        name = " & ".join(
+            self.activity_name_for_track(gpx.activity, gpx) or gpx.activity.name
+            for gpx in gpx_list
+        )
         first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
         chain_gear_ids = {
             gpx.activity.gear_id for gpx in gpx_list if gpx.activity.gear_id
@@ -708,6 +729,27 @@ class StravaMerger:
             logger.warning("Could not set gear: {}", error)
             return False, error
         logger.info("Set replacement activity gear.")
+        return True, None
+
+    def update_activity_name(
+        self, activity_id: int, name: str
+    ) -> tuple[bool, str | None]:
+        """Rename an existing Strava activity."""
+        try:
+            response = requests.put(
+                self.SINGLE_ACTIVITY_URL.format(activity_id),
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"name": name},
+                timeout=30,
+            )
+            self.check_rate_limit(response)
+        except (requests.RequestException, StravaRateLimitError) as error:
+            logger.warning("Could not rename activity: {}", error)
+            return False, str(error)
+        if response.status_code >= 300:
+            error = response.text or f"HTTP {response.status_code}"
+            logger.warning("Could not rename activity: {}", error)
+            return False, error
         return True, None
 
     def save_activities(

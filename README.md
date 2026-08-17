@@ -52,6 +52,14 @@ example:
 `--generic-name` remains an alias for compatibility, but its values are regular
 expressions as well.
 
+Generic activities are renamed automatically when any recorded GPX point comes within
+150 m of a configured location. Coordinate rules live in `NAME_DICT` and address rules
+in `ADDRESS_NAME_DICT` in `utils.py`; addresses are resolved with the configured Google
+Maps key and cached in the state file. The first matching rule wins. The defaults name
+tracks touching IBM as `IBM` and tracks touching `Langgrabenstrasse 32, 8105 Watt` as
+`Zurich Pendeln`. Activities with a custom title, and activities whose description
+contains `nomerge`, are not renamed. Successful renames appear in the same daily email.
+
 ## Fetching and persistent state
 
 `--n_activities` is the maximum number of oldest unscreened activities handled per
