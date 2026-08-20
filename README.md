@@ -37,14 +37,28 @@ replacement uses straight-line GPX coordinates at intervals of at most three sec
 The email says so; add `nomerge` instead of deleting the source if that repair is not
 acceptable.
 
-Generic titles are configured as case-insensitive glob patterns. The defaults are
-`Fahrt am *`, `Lauf am *`, and every combination of
-`Morning|Afternoon|Evening` with `Run|Ride`. Repeat `--generic-name` to replace the
-default list, for example:
+Generic titles are configured as case-insensitive regular expressions which must match
+the complete title. The defaults cover Strava's five English periods—`Morning`,
+`Lunch`, `Afternoon`, `Evening`, and `Night`—and the corresponding German titles for
+runs and rides, including older compound forms such as `Mittagsradfahrt`, `Abendlauf`,
+and `Nachtradfahrt`. Repeat `--generic-name-pattern` to replace the default list, for
+example:
 
 ```console
---generic-name "Fahrt am *" --generic-name "Lunch Ride"
+--generic-name-pattern "(?:Fahrt|Lauf) am (?:Morgen|Mittag)" \
+--generic-name-pattern "Lunch (?:Ride|Run)"
 ```
+
+`--generic-name` remains an alias for compatibility, but its values are regular
+expressions as well.
+
+Generic activities are renamed automatically when any recorded GPX point comes within
+150 m of a configured location. Coordinate rules live in `NAME_DICT` and address rules
+in `ADDRESS_NAME_DICT` in `utils.py`; addresses are resolved with the configured Google
+Maps key and cached in the state file. The first matching rule wins. The defaults name
+tracks touching IBM as `IBM` and tracks touching `Langgrabenstrasse 32, 8105 Watt` as
+`Zurich Pendeln`. Activities with a custom title, and activities whose description
+contains `nomerge`, are not renamed. Successful renames appear in the same daily email.
 
 ## Fetching and persistent state
 

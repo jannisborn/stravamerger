@@ -11,7 +11,7 @@ from automation import (
     prepare_oldest_activity_batch,
     run_automation,
 )
-from utils import DEFAULT_GENERIC_NAMES
+from utils import DEFAULT_GENERIC_NAME_PATTERNS
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -30,14 +30,14 @@ def run(
     hole_distance_threshold: float,
     state_path: str | None,
     max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
-    generic_names: Sequence[str] = DEFAULT_GENERIC_NAMES,
+    generic_name_patterns: Sequence[str] = DEFAULT_GENERIC_NAME_PATTERNS,
 ) -> None:
     merger = StravaMerger(
         credential_path,
         sender_mail=sender,
         dist_theta=distance,
         require_same_gear=require_same_gear,
-        generic_names=generic_names,
+        generic_name_patterns=generic_name_patterns,
     )
     try:
         merger.refresh_access_token()
@@ -63,7 +63,7 @@ def run(
             hole_distance_threshold=hole_distance_threshold,
             max_holes_per_activity=max_holes_per_activity,
             scan_activity_ids=scan_activity_ids,
-            generic_names=generic_names,
+            generic_name_patterns=generic_name_patterns,
         )
         store = JobStore(state_path)
         previously_screened = {
@@ -167,10 +167,14 @@ def merge(
             "in --ofolder)."
         ),
     ),
-    generic_names: list[str] | None = typer.Option(
+    generic_name_patterns: list[str] | None = typer.Option(
         None,
+        "--generic-name-pattern",
         "--generic-name",
-        help="Generic title glob; repeat to replace the default list.",
+        help=(
+            "Case-insensitive generic-title regex; repeat to replace the defaults. "
+            "Each pattern must match the complete title."
+        ),
     ),
 ):
     """Merge split activities, repair GPS holes, and upload replacements."""
@@ -189,7 +193,9 @@ def merge(
         hole_distance_threshold=hole_distance_threshold,
         state_path=state_path,
         max_holes_per_activity=max_holes_per_activity,
-        generic_names=generic_names or DEFAULT_GENERIC_NAMES,
+        generic_name_patterns=(
+            generic_name_patterns or DEFAULT_GENERIC_NAME_PATTERNS
+        ),
     )
 
 
@@ -259,10 +265,14 @@ def run_cmd(
             "in --ofolder)."
         ),
     ),
-    generic_names: list[str] | None = typer.Option(
+    generic_name_patterns: list[str] | None = typer.Option(
         None,
+        "--generic-name-pattern",
         "--generic-name",
-        help="Generic title glob; repeat to replace the default list.",
+        help=(
+            "Case-insensitive generic-title regex; repeat to replace the defaults. "
+            "Each pattern must match the complete title."
+        ),
     ),
 ):
     """Alias for the default command."""
@@ -279,7 +289,9 @@ def run_cmd(
         hole_distance_threshold=hole_distance_threshold,
         state_path=state_path,
         max_holes_per_activity=max_holes_per_activity,
-        generic_names=generic_names or DEFAULT_GENERIC_NAMES,
+        generic_name_patterns=(
+            generic_name_patterns or DEFAULT_GENERIC_NAME_PATTERNS
+        ),
     )
 
 

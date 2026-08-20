@@ -275,6 +275,17 @@ class StravaApiTests(unittest.TestCase):
         )
         self.assertTrue(request.call_args.args[0].endswith("/activities/987"))
 
+    def test_update_activity_name_uses_strava_update_endpoint(self):
+        with patch(
+            "app.requests.put", return_value=FakeResponse({}, status_code=200)
+        ) as request:
+            applied, error = self.merger.update_activity_name(987, "IBM")
+
+        self.assertTrue(applied)
+        self.assertIsNone(error)
+        self.assertEqual(request.call_args.kwargs["data"], {"name": "IBM"})
+        self.assertTrue(request.call_args.args[0].endswith("/activities/987"))
+
     def test_duplicate_activity_id_accepts_strava_html_link(self):
         error = (
             "replacement.gpx duplicate of "
@@ -313,6 +324,32 @@ class StravaApiTests(unittest.TestCase):
         track.segments.append(segment)
         gpx.tracks.append(track)
         self.assertEqual(self.merger.fixed_activity_name(activity, gpx), "IBM")
+
+    def test_generic_name_rule_matches_any_point_but_not_custom_titles(self):
+        location = (47.45, 8.48)
+        self.merger.add_activity_name_location(location, "Zurich Pendeln")
+        activity = Activity(
+            name="Radfahrt am Morgen",
+            id=12,
+            start_date="2026-08-13T07:00:00Z",
+            end_date="2026-08-13T08:00:00Z",
+            start_coords=(47.4, 8.4),
+            end_coords=(47.5, 8.5),
+            sport="Ride",
+        )
+        gpx = CustomGPX()
+        track = gpxpy.gpx.GPXTrack()
+        segment = gpxpy.gpx.GPXTrackSegment()
+        segment.points.append(gpxpy.gpx.GPXTrackPoint(*location))
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        self.assertEqual(
+            self.merger.activity_name_for_track(activity, gpx),
+            "Zurich Pendeln",
+        )
+        activity.name = "Sunday ride with friends"
+        self.assertIsNone(self.merger.activity_name_for_track(activity, gpx))
 
     def test_nomerge_also_disables_hole_repair(self):
         activity = {

@@ -233,6 +233,38 @@ class GpxFixerTests(unittest.TestCase):
         self.assertEqual(session.kwargs["params"]["latlng"], "47.3769000,8.5417000")
         self.assertEqual(session.kwargs["params"]["key"], "not-a-real-key")
 
+    def test_google_geocoding_returns_coordinates(self):
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "status": "OK",
+                    "results": [
+                        {"geometry": {"location": {"lat": 47.44, "lng": 8.48}}}
+                    ],
+                }
+
+        class Session:
+            def get(self, url, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return Response()
+
+        session = Session()
+        client = GoogleGeocodingClient("not-a-real-key", session=session)
+
+        location = client.geocode("Example Street 1, Zürich")
+
+        self.assertEqual(location, (47.44, 8.48))
+        self.assertEqual(session.url, GOOGLE_GEOCODING_URL)
+        self.assertEqual(
+            session.kwargs["params"]["address"], "Example Street 1, Zürich"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

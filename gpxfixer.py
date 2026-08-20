@@ -284,6 +284,38 @@ class GoogleGeocodingClient:
         address = results[0].get("formatted_address") if results else None
         return address or None
 
+    def geocode(self, address: str) -> tuple[float, float] | None:
+        """Return Google's coordinates for an address, or ``None`` if unknown."""
+        try:
+            response = self.session.get(
+                GOOGLE_GEOCODING_URL,
+                params={"address": address, "key": self.api_key},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as error:
+            raise GeocodingError(
+                f"Google geocoding request failed: {error}"
+            ) from error
+
+        try:
+            body = response.json()
+        except ValueError as error:
+            raise GeocodingError("Google Geocoding returned invalid JSON.") from error
+        status = body.get("status")
+        if status == "ZERO_RESULTS":
+            return None
+        if status != "OK":
+            detail = body.get("error_message") or status or "unknown error"
+            raise GeocodingError(f"Google geocoding failed: {detail}")
+        results = body.get("results") or []
+        location = (
+            results[0].get("geometry", {}).get("location") if results else None
+        )
+        if not location or "lat" not in location or "lng" not in location:
+            return None
+        return float(location["lat"]), float(location["lng"])
+
 
 def validate_route(
     hole: TrackHole,
