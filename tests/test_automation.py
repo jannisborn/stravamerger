@@ -19,6 +19,7 @@ from automation import (
     _daily_mail_body,
     _delete_mail_body,
     _fixed_activity,
+    _ignores_hole_detection,
     _load_replacement,
     _needs_name_change,
     _review_mail_body,
@@ -28,7 +29,11 @@ from automation import (
     run_automation,
 )
 from gpxfixer import GeocodingError, NoRouteError, Route, RouteError, TrackHole
-from utils import Activity, CustomGPX
+from utils import (
+    DEFAULT_HOLE_IGNORED_SPORT_TYPES,
+    Activity,
+    CustomGPX,
+)
 
 
 class AutomationStateTests(unittest.TestCase):
@@ -1024,6 +1029,70 @@ class AutomationStateTests(unittest.TestCase):
         )
 
         self.assertLessEqual(max_live_gpxs, 2)
+
+    def test_alpine_ski_and_snowboard_skip_only_hole_detection(self):
+        self.assertEqual(
+            DEFAULT_HOLE_IGNORED_SPORT_TYPES,
+            ("AlpineSki", "Snowboard"),
+        )
+        self.assertTrue(
+            _ignores_hole_detection(
+                {"sport_type": "AlpineSki"},
+                {"alpineski", "snowboard"},
+            )
+        )
+        self.assertFalse(
+            _ignores_hole_detection(
+                {"sport_type": "NordicSki"},
+                {"alpineski", "snowboard"},
+            )
+        )
+
+        class Merger:
+            google_maps_api_key = None
+
+            @staticmethod
+            def detect_merging_activities(activities):
+                # The activity still reaches merge discovery.
+                self.assertEqual([activity["id"] for activity in activities], [10])
+                return []
+
+            can_fix_activity = staticmethod(StravaMerger.can_fix_activity)
+
+            @staticmethod
+            def activity_to_gpx(activity):
+                raise AssertionError("Ignored sports must not download a GPX")
+
+            @staticmethod
+            def send_email(*args, **kwargs):
+                raise AssertionError("An ignored hole check needs no email")
+
+        activity = {
+            "id": 10,
+            "name": "Ski day",
+            "start_date": "2026-01-10T07:00:00Z",
+            "start_date_local": "2026-01-10T08:00:00Z",
+            "elapsed_time": 3600,
+            "start_latlng": [46.8, 9.8],
+            "end_latlng": [46.9, 9.9],
+            "sport_type": "AlpineSki",
+            "description": "",
+        }
+        state_path = os.path.join(self.temporary_directory.name, "ski-state.json")
+        store = JobStore(state_path)
+        store.mark_for_review(10, "Activity 10 has 8 holes.", name="Ski day")
+
+        summary = run_automation(
+            Merger(),
+            activities=[activity],
+            output_folder=self.temporary_directory.name,
+            recipient="me@example.com",
+            state_path=state_path,
+            fix_holes=True,
+        )
+
+        self.assertEqual(summary.screened_activity_ids, {10})
+        self.assertIsNone(JobStore(state_path).review_reason(10))
 
     def test_completed_jobs_no_longer_claim_sources(self):
         state_path = os.path.join(self.temporary_directory.name, "state.json")

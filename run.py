@@ -11,7 +11,10 @@ from automation import (
     prepare_oldest_activity_batch,
     run_automation,
 )
-from utils import DEFAULT_GENERIC_NAME_PATTERNS
+from utils import (
+    DEFAULT_GENERIC_NAME_PATTERNS,
+    DEFAULT_HOLE_IGNORED_SPORT_TYPES,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -31,6 +34,7 @@ def run(
     state_path: str | None,
     max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
     generic_name_patterns: Sequence[str] = DEFAULT_GENERIC_NAME_PATTERNS,
+    hole_ignored_sport_types: Sequence[str] = DEFAULT_HOLE_IGNORED_SPORT_TYPES,
 ) -> None:
     merger = StravaMerger(
         credential_path,
@@ -64,6 +68,7 @@ def run(
             max_holes_per_activity=max_holes_per_activity,
             scan_activity_ids=scan_activity_ids,
             generic_name_patterns=generic_name_patterns,
+            hole_ignored_sport_types=hole_ignored_sport_types,
         )
         store = JobStore(state_path)
         previously_screened = {
@@ -176,6 +181,14 @@ def merge(
             "Each pattern must match the complete title."
         ),
     ),
+    hole_ignored_sport_types: list[str] | None = typer.Option(
+        None,
+        "--ignore-holes-for-sport",
+        help=(
+            "Strava sport_type excluded from hole detection; repeat to replace "
+            "the AlpineSki and Snowboard defaults."
+        ),
+    ),
 ):
     """Merge split activities, repair GPS holes, and upload replacements."""
     if ctx.invoked_subcommand is not None:
@@ -195,6 +208,9 @@ def merge(
         max_holes_per_activity=max_holes_per_activity,
         generic_name_patterns=(
             generic_name_patterns or DEFAULT_GENERIC_NAME_PATTERNS
+        ),
+        hole_ignored_sport_types=(
+            hole_ignored_sport_types or DEFAULT_HOLE_IGNORED_SPORT_TYPES
         ),
     )
 
@@ -274,6 +290,14 @@ def run_cmd(
             "Each pattern must match the complete title."
         ),
     ),
+    hole_ignored_sport_types: list[str] | None = typer.Option(
+        None,
+        "--ignore-holes-for-sport",
+        help=(
+            "Strava sport_type excluded from hole detection; repeat to replace "
+            "the AlpineSki and Snowboard defaults."
+        ),
+    ),
 ):
     """Alias for the default command."""
     run(
@@ -291,6 +315,9 @@ def run_cmd(
         max_holes_per_activity=max_holes_per_activity,
         generic_name_patterns=(
             generic_name_patterns or DEFAULT_GENERIC_NAME_PATTERNS
+        ),
+        hole_ignored_sport_types=(
+            hole_ignored_sport_types or DEFAULT_HOLE_IGNORED_SPORT_TYPES
         ),
     )
 

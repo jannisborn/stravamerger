@@ -90,6 +90,11 @@ DEFAULT_GENERIC_NAME_PATTERNS = (
     r"(?:Morgen|Mittags|Nachmittags|Abend|Nacht)(?:radfahrt|lauf)",
 )
 
+DEFAULT_HOLE_IGNORED_SPORT_TYPES = (
+    "AlpineSki",
+    "Snowboard",
+)
+
 
 def is_generic_activity_name(
     name: str,
