@@ -93,6 +93,8 @@ DEFAULT_GENERIC_NAME_PATTERNS = (
 DEFAULT_HOLE_IGNORED_SPORT_TYPES = (
     "AlpineSki",
     "Snowboard",
+    "Windsurf",
+    "Rowing"
 )
 
 
