@@ -38,6 +38,7 @@ from gpxfixer import (
 from utils import (
     ADDRESS_NAME_DICT,
     DEFAULT_GENERIC_NAME_PATTERNS,
+    DEFAULT_HOLE_IGNORED_SPORT_TYPES,
     Activity,
     CustomGPX,
     is_generic_activity_name,
@@ -446,12 +447,18 @@ def run_automation(
     max_holes_per_activity: int = MAX_HOLES_PER_ACTIVITY,
     scan_activity_ids: set[int] | None = None,
     generic_name_patterns: Sequence[str] = DEFAULT_GENERIC_NAME_PATTERNS,
+    hole_ignored_sport_types: Sequence[str] = DEFAULT_HOLE_IGNORED_SPORT_TYPES,
 ) -> AutomationSummary:
     """Resume queued jobs, discover new replacements, and upload what is ready."""
     if hole_time_threshold < 0 or hole_distance_threshold < 0:
         raise ValueError("Hole detection thresholds cannot be negative.")
     if max_holes_per_activity < 1:
         raise ValueError("The maximum number of holes must be at least one.")
+    hole_ignored_sport_types = {
+        sport_type.strip().casefold()
+        for sport_type in hole_ignored_sport_types
+        if sport_type.strip()
+    }
     store = JobStore(state_path)
     summary = AutomationSummary()
     _configure_activity_name_locations(merger, store)
@@ -475,6 +482,7 @@ def run_automation(
         store,
         activities_by_id=activities_by_id,
         source_exists_cache=source_exists_cache,
+        hole_ignored_sport_types=hole_ignored_sport_types,
     )
     _refresh_pending_source_activities(
         merger,
@@ -557,6 +565,9 @@ def run_automation(
     def repair(gpx: CustomGPX) -> tuple[CustomGPX | None, list[dict[str, Any]]]:
         nonlocal geocoding_client, google_client
         activity = gpx.activity
+        if _ignores_hole_detection(activity, hole_ignored_sport_types):
+            store.clear_review(activity.id)
+            return gpx, []
         if not fix_holes or any(
             marker in activity.description.lower() for marker in ("nofix", "nomerge")
         ):
@@ -756,6 +767,9 @@ def run_automation(
                 activity.id,
                 max_holes_per_activity=max_holes_per_activity,
             )
+            and not _ignores_hole_detection(
+                activity, hole_ignored_sport_types
+            )
             and "nofix" not in activity.description.lower()
             for activity in chain
         ):
@@ -836,10 +850,15 @@ def run_automation(
             not api_activity.get("start_latlng")
             or StravaMerger.is_bot_activity(api_activity)
             or store.was_checked_clean(activity_id)
-            or _review_blocks_retry(
-                store,
-                activity_id,
-                max_holes_per_activity=max_holes_per_activity,
+            or (
+                _review_blocks_retry(
+                    store,
+                    activity_id,
+                    max_holes_per_activity=max_holes_per_activity,
+                )
+                and not _ignores_hole_detection(
+                    api_activity, hole_ignored_sport_types
+                )
             )
         ):
             summary.screened_activity_ids.add(activity_id)
@@ -847,7 +866,12 @@ def run_automation(
         should_match_name = is_generic_activity_name(
             api_activity.get("name") or "", generic_name_patterns
         )
-        if not fix_holes and not should_match_name:
+        ignores_holes = _ignores_hole_detection(
+            api_activity, hole_ignored_sport_types
+        )
+        if ignores_holes:
+            store.clear_review(activity_id)
+        if (not fix_holes or ignores_holes) and not should_match_name:
             summary.screened_activity_ids.add(activity_id)
             continue
         requests_needed = 1 + _activity_detail_request_needed(
@@ -877,7 +901,14 @@ def run_automation(
             not in (api_activity.get("description") or "").lower()
         )
         can_fix = merger.can_fix_activity(api_activity)
-        if not should_match_name and (not fix_holes or not can_fix):
+        ignores_holes = _ignores_hole_detection(
+            api_activity, hole_ignored_sport_types
+        )
+        if ignores_holes:
+            store.clear_review(activity_id)
+        if not should_match_name and (
+            not fix_holes or not can_fix or ignores_holes
+        ):
             summary.screened_activity_ids.add(activity_id)
             continue
         source = merger.activity_from_api(api_activity)
@@ -890,7 +921,7 @@ def run_automation(
                 original,
                 summary,
             )
-        if not fix_holes or not can_fix:
+        if not fix_holes or not can_fix or ignores_holes:
             summary.screened_activity_ids.add(activity_id)
             continue
         repaired, hole_details = repair(original)
@@ -1329,6 +1360,7 @@ def _refresh_reviews(
     *,
     activities_by_id: dict[int, dict[str, Any]],
     source_exists_cache: dict[int, bool],
+    hole_ignored_sport_types: set[str],
 ) -> None:
     """Refresh manual-review items and consume explicit opt-outs."""
     get_activity = getattr(merger, "get_activity", None)
@@ -1351,11 +1383,29 @@ def _refresh_reviews(
                 source_exists_cache,
             )
         description = (activity or {}).get("description") or ""
-        if activity is None or any(
-            marker in description.lower() for marker in ("nomerge", "nofix")
+        if (
+            activity is None
+            or _ignores_hole_detection(activity, hole_ignored_sport_types)
+            or any(
+                marker in description.lower() for marker in ("nomerge", "nofix")
+            )
         ):
             store.data["reviews"].pop(activity_id_text, None)
     store.save()
+
+
+def _ignores_hole_detection(
+    activity: Activity | dict[str, Any],
+    ignored_sport_types: set[str],
+) -> bool:
+    """Return whether this Strava sport is excluded only from hole detection."""
+    if isinstance(activity, Activity):
+        sport_type = activity.sport
+    else:
+        sport_type = activity.get("sport_type") or activity.get("type")
+    return bool(
+        sport_type and str(sport_type).strip().casefold() in ignored_sport_types
+    )
 
 
 def _refresh_pending_source_activities(
