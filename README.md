@@ -82,13 +82,17 @@ ten requests in reserve, and stops starting new checks when that reserve is reac
 Progress is recorded in `<ofolder>/stravamerger-state.json`. Once the historical
 catalog is exhausted, the same unchanged daily command processes only newly discovered
 activities. The summary refresh still lists the catalog so backdated uploads are not
-missed, but it does not download old descriptions or GPS streams again.
+missed, but it does not download old descriptions or GPS streams again. Activities
+from the current day remain pending so a later upload that day can still be merged.
+Changing a screened activity's catalog metadata, including its activity type, queues
+it for another pass.
 
 Queued replacements embed their GPX data in the state file and are uploaded from
 memory as gzip-compressed text. Separate GPX files are temporary recovery backups.
 They and the embedded data are removed after upload or cancellation; terminal jobs are
-pruned after their final notification. The compact history retains IDs, timestamps,
-unresolved reminders, and pending summaries rather than full completed activities.
+pruned after their final notification. The compact history retains IDs, catalog
+summaries, timestamps, unresolved reminders, and pending summaries rather than full
+completed activities.
 
 There is no `--force-refresh` flag. Deleting `stravamerger-state.json` starts a new
 oldest-first pass. Do not delete it while replacements are pending because it contains
