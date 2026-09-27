@@ -177,6 +177,36 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(merger.full_calls, 2)
         self.assertLess(os.path.getsize(state_path), 2_000)
 
+    def test_current_day_activities_stay_pending_for_later_merges(self):
+        today = datetime.now().astimezone().date().isoformat()
+        yesterday = (
+            datetime.now().astimezone() - timedelta(days=1)
+        ).date().isoformat()
+        activities = [
+            {
+                "id": activity_id,
+                "name": f"Ride {activity_id}",
+                "start_date_local": f"{date}T08:00:00Z",
+            }
+            for activity_id, date in ((1, today), (2, yesterday))
+        ]
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        store = JobStore(state_path)
+        store.sync_catalog(activities, initialize=True)
+
+        store.record_screened({1, 2})
+
+        self.assertEqual(store.data["scan"]["screened_ids"], [2])
+        self.assertIn("1", store.data["scan"]["pending"])
+        self.assertNotIn("2", store.data["scan"]["pending"])
+
+        store.data["scan"]["pending"].pop("1")
+        store.data["scan"]["screened_ids"].append(1)
+        store.sync_catalog(activities)
+
+        self.assertEqual(store.data["scan"]["screened_ids"], [2])
+        self.assertIn("1", store.data["scan"]["pending"])
+
     def test_bot_replacements_are_excluded_from_screened_count(self):
         state_path = os.path.join(self.temporary_directory.name, "history.json")
         store = JobStore(state_path)
@@ -246,6 +276,39 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(added, 0)
         self.assertEqual(pending["name"], "Lake loop")
         self.assertEqual(pending["gear_id"], "new-bike")
+
+    def test_modified_screened_activity_is_requeued(self):
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        store = JobStore(state_path)
+        activity = {
+            "id": 1,
+            "name": "Morning workout",
+            "start_date_local": "2020-01-01T09:00:00Z",
+            "sport_type": "Ride",
+            "type": "Ride",
+        }
+        store.sync_catalog([activity], initialize=True)
+        store.record_screened({1})
+        store.mark_checked_clean(1)
+        store.mark_for_review(
+            1,
+            "Activity 1 has 16 holes, exceeding the automatic limit of 15.",
+            hole_details=[{"distance_meters": 500}] * 16,
+        )
+
+        store.sync_catalog([activity])
+        self.assertEqual(store.data["scan"]["screened_ids"], [1])
+
+        activity["sport_type"] = "Run"
+        activity["type"] = "Run"
+        store.sync_catalog([activity])
+
+        self.assertEqual(store.data["scan"]["screened_ids"], [])
+        self.assertEqual(
+            store.data["scan"]["pending"]["1"]["sport_type"], "Run"
+        )
+        self.assertFalse(store.was_checked_clean(1))
+        self.assertIsNone(store.review_reason(1))
 
     def test_legacy_review_is_requeued_for_structured_hole_details(self):
         state_path = os.path.join(self.temporary_directory.name, "history.json")

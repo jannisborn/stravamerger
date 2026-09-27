@@ -52,7 +52,11 @@ CATALOG_KEYS = (
     "name",
     "start_date",
     "start_date_local",
+    "description",
+    "distance",
     "elapsed_time",
+    "moving_time",
+    "total_elevation_gain",
     "start_latlng",
     "end_latlng",
     "gear_id",
@@ -98,6 +102,7 @@ class JobStore:
                 "initialized": False,
                 "pending": {},
                 "screened_ids": [],
+                "screened_summaries": {},
                 "excluded_ids": [],
                 "last_screened_start_date": None,
             },
@@ -105,6 +110,7 @@ class JobStore:
         scan.setdefault("initialized", False)
         scan.setdefault("pending", {})
         scan.setdefault("screened_ids", [])
+        scan.setdefault("screened_summaries", {})
         scan.setdefault("excluded_ids", [])
         scan.setdefault("last_screened_start_date", None)
 
@@ -167,6 +173,7 @@ class JobStore:
         """Refresh the compact oldest-first catalog and add unseen summaries."""
         scan = self.data["scan"]
         screened = {int(activity_id) for activity_id in scan["screened_ids"]}
+        screened_summaries = scan["screened_summaries"]
         excluded = {int(activity_id) for activity_id in scan["excluded_ids"]}
         pending = scan["pending"]
         added = 0
@@ -178,9 +185,20 @@ class JobStore:
                 or activity_id in excluded
                 or key in pending
             )
+            summary = _catalog_summary(activity)
+            previous_summary = pending.get(key) or screened_summaries.get(key)
+            if previous_summary is not None and previous_summary != summary:
+                screened.discard(activity_id)
+                screened_summaries.pop(key, None)
+                self.data["checks"].pop(key, None)
+                self.data["reviews"].pop(key, None)
+            if _is_from_today(activity):
+                screened.discard(activity_id)
+                screened_summaries.pop(key, None)
             if StravaMerger.is_bot_activity(activity):
                 pending.pop(key, None)
                 screened.discard(activity_id)
+                screened_summaries.pop(key, None)
                 excluded.add(activity_id)
                 continue
             review = self.data["reviews"].get(key)
@@ -191,13 +209,12 @@ class JobStore:
                 # Older state files kept only the review message. Requeue the
                 # activity once so the daily report can gain structured endpoints.
                 screened.discard(activity_id)
+                screened_summaries.pop(key, None)
             if activity_id in screened or activity_id in excluded:
+                if activity_id in screened:
+                    screened_summaries.setdefault(key, summary)
                 continue
-            pending[key] = {
-                field: activity.get(field)
-                for field in CATALOG_KEYS
-                if field in activity
-            }
+            pending[key] = summary
             added += int(not previously_known)
         scan["screened_ids"] = sorted(screened)
         scan["excluded_ids"] = sorted(excluded)
@@ -234,10 +251,15 @@ class JobStore:
             return
         scan = self.data["scan"]
         screened = {int(activity_id) for activity_id in scan["screened_ids"]}
+        screened_summaries = scan["screened_summaries"]
         dates = []
         for activity_id in activity_ids:
+            summary = scan["pending"].get(str(activity_id))
+            if summary and _is_from_today(summary):
+                continue
             summary = scan["pending"].pop(str(activity_id), None)
             if summary:
+                screened_summaries[str(activity_id)] = summary
                 date = summary.get("start_date_local") or summary.get("start_date")
                 if date:
                     dates.append(date)
@@ -2076,6 +2098,22 @@ def _format_distance(distance_meters: float) -> str:
 
 def _short_address(address: str) -> str:
     return address.split(",", maxsplit=1)[0].strip()
+
+
+def _catalog_summary(activity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: activity.get(field)
+        for field in CATALOG_KEYS
+        if field in activity
+    }
+
+
+def _is_from_today(activity: dict[str, Any]) -> bool:
+    start_date = activity.get("start_date_local") or activity.get("start_date")
+    return bool(
+        start_date
+        and start_date[:10] == datetime.now().astimezone().date().isoformat()
+    )
 
 
 def _hole_repair_summary(hole_details: list[dict[str, Any]]) -> str:
