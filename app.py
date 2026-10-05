@@ -433,7 +433,7 @@ class StravaMerger:
 
             description = activity.get("description") or ""
 
-            if "nomerge" in description.lower() or self.is_bot_activity(activity):
+            if "nomerge" in description.lower():
                 continue
 
             activity_object = self.activity_from_api(activity)

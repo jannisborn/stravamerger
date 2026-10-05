@@ -85,7 +85,7 @@ activities. The summary refresh still lists the catalog so backdated uploads are
 missed, but it does not download old descriptions or GPS streams again. Activities
 from the current day remain pending so a later upload that day can still be merged.
 Changing a screened activity's catalog metadata, including its activity type, queues
-it for another pass.
+it and every other activity from the same day for another pass.
 
 Queued replacements embed their GPX data in the state file and are uploaded from
 memory as gzip-compressed text. Separate GPX files are temporary recovery backups.

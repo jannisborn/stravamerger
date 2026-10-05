@@ -8,7 +8,7 @@ from unittest.mock import patch
 import gpxpy.gpx
 import requests
 
-from app import StravaMerger, StravaRateLimitError
+from app import BOT_MARKER, StravaMerger, StravaRateLimitError
 from utils import Activity, CustomGPX
 
 
@@ -381,6 +381,44 @@ class StravaApiTests(unittest.TestCase):
         }
 
         self.assertTrue(StravaMerger.is_bot_activity(activity))
+
+    def test_requeued_bot_replacement_can_form_a_merge_chain(self):
+        def activity(activity_id, start, start_coords, end_coords, **extra):
+            return {
+                "id": activity_id,
+                "name": f"Run {activity_id}",
+                "start_date": start,
+                "start_date_local": start,
+                "elapsed_time": 3_600,
+                "start_latlng": start_coords,
+                "end_latlng": end_coords,
+                "sport_type": "Run",
+                **extra,
+            }
+
+        previous_merge = activity(
+            1,
+            "2020-01-01T08:00:00Z",
+            [47.0, 8.0],
+            [47.1, 8.1],
+            description=BOT_MARKER,
+            external_id="stravamerger-merge-5-6",
+        )
+        changed_run = activity(
+            2,
+            "2020-01-01T09:00:00Z",
+            [47.1, 8.1],
+            [47.2, 8.2],
+        )
+
+        chains = self.merger.detect_merging_activities(
+            [previous_merge, changed_run]
+        )
+
+        self.assertEqual(
+            [[item.id for item in chain] for chain in chains],
+            [[1, 2]],
+        )
 
 
 if __name__ == "__main__":

@@ -287,8 +287,34 @@ class AutomationStateTests(unittest.TestCase):
             "sport_type": "Ride",
             "type": "Ride",
         }
-        store.sync_catalog([activity], initialize=True)
-        store.record_screened({1})
+        activities = [
+            activity,
+            {
+                "id": 2,
+                "name": "Evening workout",
+                "start_date_local": "2020-01-01T17:00:00Z",
+                "sport_type": "Run",
+                "type": "Run",
+            },
+            {
+                "id": 3,
+                "name": "Next-day workout",
+                "start_date_local": "2020-01-02T09:00:00Z",
+                "sport_type": "Ride",
+                "type": "Ride",
+            },
+            {
+                "id": 4,
+                "name": "Previously merged run",
+                "description": "StravaMerger bot · merged activities 5 + 6.",
+                "external_id": "stravamerger-merge-5-6",
+                "start_date_local": "2020-01-01T07:00:00Z",
+                "sport_type": "Run",
+                "type": "Run",
+            },
+        ]
+        store.sync_catalog(activities, initialize=True)
+        store.record_screened({1, 2, 3})
         store.mark_checked_clean(1)
         store.mark_for_review(
             1,
@@ -296,14 +322,16 @@ class AutomationStateTests(unittest.TestCase):
             hole_details=[{"distance_meters": 500}] * 16,
         )
 
-        store.sync_catalog([activity])
-        self.assertEqual(store.data["scan"]["screened_ids"], [1])
+        store.sync_catalog(activities)
+        self.assertEqual(store.data["scan"]["screened_ids"], [1, 2, 3])
 
         activity["sport_type"] = "Run"
         activity["type"] = "Run"
-        store.sync_catalog([activity])
+        store.sync_catalog(activities)
 
-        self.assertEqual(store.data["scan"]["screened_ids"], [])
+        self.assertEqual(store.data["scan"]["screened_ids"], [3])
+        self.assertEqual(set(store.data["scan"]["pending"]), {"1", "2", "4"})
+        self.assertEqual(store.data["scan"]["excluded_ids"], [])
         self.assertEqual(
             store.data["scan"]["pending"]["1"]["sport_type"], "Run"
         )

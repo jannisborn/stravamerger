@@ -176,8 +176,24 @@ class JobStore:
         screened_summaries = scan["screened_summaries"]
         excluded = {int(activity_id) for activity_id in scan["excluded_ids"]}
         pending = scan["pending"]
+        catalog = [
+            (activity, _catalog_summary(activity)) for activity in activities
+        ]
+        changed_dates = set()
+        for activity, summary in catalog:
+            key = str(activity["id"])
+            previous_summary = pending.get(key) or screened_summaries.get(key)
+            if previous_summary is not None and previous_summary != summary:
+                changed_dates.update(
+                    date
+                    for date in (
+                        _activity_date(previous_summary),
+                        _activity_date(summary),
+                    )
+                    if date
+                )
         added = 0
-        for activity in activities:
+        for activity, summary in catalog:
             activity_id = int(activity["id"])
             key = str(activity_id)
             previously_known = (
@@ -185,22 +201,24 @@ class JobStore:
                 or activity_id in excluded
                 or key in pending
             )
-            summary = _catalog_summary(activity)
             previous_summary = pending.get(key) or screened_summaries.get(key)
             if previous_summary is not None and previous_summary != summary:
-                screened.discard(activity_id)
-                screened_summaries.pop(key, None)
                 self.data["checks"].pop(key, None)
                 self.data["reviews"].pop(key, None)
+            day_reopened = _activity_date(summary) in changed_dates
+            if day_reopened:
+                screened.discard(activity_id)
+                screened_summaries.pop(key, None)
             if _is_from_today(activity):
                 screened.discard(activity_id)
                 screened_summaries.pop(key, None)
-            if StravaMerger.is_bot_activity(activity):
+            if StravaMerger.is_bot_activity(activity) and not day_reopened:
                 pending.pop(key, None)
                 screened.discard(activity_id)
                 screened_summaries.pop(key, None)
                 excluded.add(activity_id)
                 continue
+            excluded.discard(activity_id)
             review = self.data["reviews"].get(key)
             if review and _review_needs_rescan(
                 review,
@@ -776,7 +794,6 @@ def run_automation(
             continue
         if any(
             "nomerge" in (activity.get("description") or "").lower()
-            or StravaMerger.is_bot_activity(activity)
             for activity in detailed_activities
         ):
             merged_source_ids.difference_update(
@@ -2123,12 +2140,13 @@ def _catalog_summary(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _is_from_today(activity: dict[str, Any]) -> bool:
+def _activity_date(activity: dict[str, Any]) -> str | None:
     start_date = activity.get("start_date_local") or activity.get("start_date")
-    return bool(
-        start_date
-        and start_date[:10] == datetime.now().astimezone().date().isoformat()
-    )
+    return start_date[:10] if start_date else None
+
+
+def _is_from_today(activity: dict[str, Any]) -> bool:
+    return _activity_date(activity) == datetime.now().astimezone().date().isoformat()
 
 
 def _hole_repair_summary(hole_details: list[dict[str, Any]]) -> str:
