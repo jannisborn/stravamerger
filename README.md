@@ -87,6 +87,7 @@ from the current day remain pending so a later upload that day can still be merg
 Changing a screened activity's catalog metadata, including its activity type, queues
 it and every other activity from the same day for another pass.
 
+
 Queued replacements embed their GPX data in the state file and are uploaded from
 memory as gzip-compressed text. Separate GPX files are temporary recovery backups.
 They and the embedded data are removed after upload or cancellation; terminal jobs are
