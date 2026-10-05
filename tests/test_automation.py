@@ -437,6 +437,51 @@ class AutomationStateTests(unittest.TestCase):
         self.assertNotIn("10", store.data["name_reminders"])
         self.assertIn('Renamed "Radfahrt am Morgen"', summary.info_messages[0])
 
+    def test_current_day_activity_is_not_renamed_or_reminded(self):
+        class Merger:
+            def __init__(self):
+                self.updates = []
+
+            @staticmethod
+            def activity_name_for_track(activity, gpx):
+                return "IBM"
+
+            def update_activity_name(self, activity_id, name):
+                self.updates.append((activity_id, name))
+                return True, None
+
+        today = datetime.now().astimezone().date().isoformat()
+        activity = {
+            "id": 10,
+            "name": "Morning Ride",
+            "start_date_local": f"{today}T08:00:00Z",
+        }
+        store = JobStore(
+            os.path.join(self.temporary_directory.name, "state.json")
+        )
+        store.update_name_reminder(activity, (r"Morning Ride",))
+        gpx = CustomGPX()
+        gpx.set_activity(
+            Activity(
+                name=activity["name"],
+                id=10,
+                start_date=activity["start_date_local"],
+                end_date=f"{today}T09:00:00Z",
+                start_coords=(47.4, 8.4),
+                end_coords=(47.5, 8.5),
+                sport="Ride",
+            )
+        )
+        merger = Merger()
+
+        renamed = _auto_rename_activity(
+            merger, store, activity, gpx, AutomationSummary()
+        )
+
+        self.assertFalse(renamed)
+        self.assertEqual(merger.updates, [])
+        self.assertNotIn("10", store.data["name_reminders"])
+
     def test_routing_fallback_is_limited_to_no_route_or_indirect_route(self):
         hole = TrackHole(
             track_index=0,

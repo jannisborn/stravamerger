@@ -670,10 +670,14 @@ class StravaMerger:
 
     def get_new_activity(self, gpx_list: list[CustomGPX]) -> Activity:
         """Returns a list of new activities to be uploaded to Strava."""
-        name = " & ".join(
-            self.activity_name_for_track(gpx.activity, gpx) or gpx.activity.name
+        today = datetime.now().astimezone().date()
+        names = dict.fromkeys(
+            gpx.activity.name
+            if parse_date(gpx.activity.start_date).date() == today
+            else self.activity_name_for_track(gpx.activity, gpx) or gpx.activity.name
             for gpx in gpx_list
         )
+        name = " & ".join(names)
         first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
         chain_gear_ids = {
             gpx.activity.gear_id for gpx in gpx_list if gpx.activity.gear_id

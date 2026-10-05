@@ -62,7 +62,7 @@ in `ADDRESS_NAME_DICT` in `utils.py`; addresses are resolved with the configured
 Maps key and cached in the state file. The first matching rule wins. The defaults name
 tracks touching IBM as `IBM` and tracks touching `Langgrabenstrasse 32, 8105 Watt` as
 `Zurich Pendeln`. Activities with a custom title, and activities whose description
-contains `nomerge`, are not renamed. Successful renames appear in the same daily email.
+contains `nomerge`, are not renamed.
 
 ## Fetching and persistent state
 

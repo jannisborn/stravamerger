@@ -283,6 +283,9 @@ class JobStore:
         generic_name_patterns: Sequence[str],
     ) -> None:
         key = str(activity["id"])
+        if _is_from_today(activity):
+            self.data["name_reminders"].pop(key, None)
+            return
         if is_generic_activity_name(
             activity.get("name") or "", generic_name_patterns
         ):
@@ -885,8 +888,11 @@ def run_automation(
         ):
             summary.screened_activity_ids.add(activity_id)
             continue
-        should_match_name = is_generic_activity_name(
-            api_activity.get("name") or "", generic_name_patterns
+        should_match_name = (
+            not _is_from_today(api_activity)
+            and is_generic_activity_name(
+                api_activity.get("name") or "", generic_name_patterns
+            )
         )
         ignores_holes = _ignores_hole_detection(
             api_activity, hole_ignored_sport_types
@@ -916,7 +922,8 @@ def run_automation(
             continue
         store.update_name_reminder(api_activity, generic_name_patterns)
         should_match_name = (
-            is_generic_activity_name(
+            not _is_from_today(api_activity)
+            and is_generic_activity_name(
                 api_activity.get("name") or "", generic_name_patterns
             )
             and "nomerge"
@@ -959,7 +966,11 @@ def run_automation(
         replacement.activity = _fixed_activity(
             source,
             len(hole_details),
-            name=merger.fixed_activity_name(source, replacement),
+            name=(
+                source.name
+                if _is_from_today(api_activity)
+                else merger.fixed_activity_name(source, replacement)
+            ),
             hole_details=hole_details,
         )
         job_id = f"fix-{source.id}"
@@ -1275,6 +1286,8 @@ def _auto_rename_activity(
     summary: AutomationSummary,
 ) -> bool:
     """Rename one generic activity when its track touches a configured location."""
+    if _is_from_today(activity):
+        return False
     source = gpx.activity
     new_name = merger.activity_name_for_track(source, gpx)
     if not new_name:
@@ -1345,6 +1358,8 @@ def _refresh_name_reminders(
         else:
             store.update_name_reminder(activity, generic_name_patterns)
             reminder = store.data["name_reminders"].get(str(activity_id), {})
+            if not reminder:
+                continue
             rule_version = getattr(merger, "activity_name_rule_version", None)
             can_auto_rename = all(
                 callable(getattr(merger, method, None))

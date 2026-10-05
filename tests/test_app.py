@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 import gpxpy.gpx
@@ -258,6 +259,20 @@ class StravaApiTests(unittest.TestCase):
             r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\.$",
         )
         self.assertNotRegex(merged.description, r"\d{2}:\d{2}:\d{2}")
+
+        self.merger.activity_name_for_track = lambda activity, gpx: "IBM"
+        self.assertEqual(self.merger.get_new_activity(activities).name, "IBM")
+
+        today = datetime.now().astimezone().date().isoformat()
+        for activity in activities:
+            activity.activity.start_date = f"{today}T07:00:00Z"
+        self.merger.activity_name_for_track = (
+            lambda activity, gpx: "IBM" if activity.id == 1 else "X"
+        )
+        self.assertEqual(
+            self.merger.get_new_activity(activities).name,
+            "Ride 1 & Ride 2",
+        )
 
         activities[1].activity.gear_id = "bike-2"
         self.assertIsNone(self.merger.get_new_activity(activities).gear_id)
