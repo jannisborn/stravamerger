@@ -287,8 +287,34 @@ class AutomationStateTests(unittest.TestCase):
             "sport_type": "Ride",
             "type": "Ride",
         }
-        store.sync_catalog([activity], initialize=True)
-        store.record_screened({1})
+        activities = [
+            activity,
+            {
+                "id": 2,
+                "name": "Evening workout",
+                "start_date_local": "2020-01-01T17:00:00Z",
+                "sport_type": "Run",
+                "type": "Run",
+            },
+            {
+                "id": 3,
+                "name": "Next-day workout",
+                "start_date_local": "2020-01-02T09:00:00Z",
+                "sport_type": "Ride",
+                "type": "Ride",
+            },
+            {
+                "id": 4,
+                "name": "Previously merged run",
+                "description": "StravaMerger bot · merged activities 5 + 6.",
+                "external_id": "stravamerger-merge-5-6",
+                "start_date_local": "2020-01-01T07:00:00Z",
+                "sport_type": "Run",
+                "type": "Run",
+            },
+        ]
+        store.sync_catalog(activities, initialize=True)
+        store.record_screened({1, 2, 3})
         store.mark_checked_clean(1)
         store.mark_for_review(
             1,
@@ -296,14 +322,16 @@ class AutomationStateTests(unittest.TestCase):
             hole_details=[{"distance_meters": 500}] * 16,
         )
 
-        store.sync_catalog([activity])
-        self.assertEqual(store.data["scan"]["screened_ids"], [1])
+        store.sync_catalog(activities)
+        self.assertEqual(store.data["scan"]["screened_ids"], [1, 2, 3])
 
         activity["sport_type"] = "Run"
         activity["type"] = "Run"
-        store.sync_catalog([activity])
+        store.sync_catalog(activities)
 
-        self.assertEqual(store.data["scan"]["screened_ids"], [])
+        self.assertEqual(store.data["scan"]["screened_ids"], [3])
+        self.assertEqual(set(store.data["scan"]["pending"]), {"1", "2", "4"})
+        self.assertEqual(store.data["scan"]["excluded_ids"], [])
         self.assertEqual(
             store.data["scan"]["pending"]["1"]["sport_type"], "Run"
         )
@@ -436,6 +464,51 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(activity["name"], "Zurich Pendeln")
         self.assertNotIn("10", store.data["name_reminders"])
         self.assertIn('Renamed "Radfahrt am Morgen"', summary.info_messages[0])
+
+    def test_current_day_activity_is_not_renamed_or_reminded(self):
+        class Merger:
+            def __init__(self):
+                self.updates = []
+
+            @staticmethod
+            def activity_name_for_track(activity, gpx):
+                return "IBM"
+
+            def update_activity_name(self, activity_id, name):
+                self.updates.append((activity_id, name))
+                return True, None
+
+        today = datetime.now().astimezone().date().isoformat()
+        activity = {
+            "id": 10,
+            "name": "Morning Ride",
+            "start_date_local": f"{today}T08:00:00Z",
+        }
+        store = JobStore(
+            os.path.join(self.temporary_directory.name, "state.json")
+        )
+        store.update_name_reminder(activity, (r"Morning Ride",))
+        gpx = CustomGPX()
+        gpx.set_activity(
+            Activity(
+                name=activity["name"],
+                id=10,
+                start_date=activity["start_date_local"],
+                end_date=f"{today}T09:00:00Z",
+                start_coords=(47.4, 8.4),
+                end_coords=(47.5, 8.5),
+                sport="Ride",
+            )
+        )
+        merger = Merger()
+
+        renamed = _auto_rename_activity(
+            merger, store, activity, gpx, AutomationSummary()
+        )
+
+        self.assertFalse(renamed)
+        self.assertEqual(merger.updates, [])
+        self.assertNotIn("10", store.data["name_reminders"])
 
     def test_routing_fallback_is_limited_to_no_route_or_indirect_route(self):
         hole = TrackHole(
