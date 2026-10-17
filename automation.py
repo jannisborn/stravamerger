@@ -176,8 +176,24 @@ class JobStore:
         screened_summaries = scan["screened_summaries"]
         excluded = {int(activity_id) for activity_id in scan["excluded_ids"]}
         pending = scan["pending"]
+        catalog = [
+            (activity, _catalog_summary(activity)) for activity in activities
+        ]
+        changed_dates = set()
+        for activity, summary in catalog:
+            key = str(activity["id"])
+            previous_summary = pending.get(key) or screened_summaries.get(key)
+            if previous_summary is not None and previous_summary != summary:
+                changed_dates.update(
+                    date
+                    for date in (
+                        _activity_date(previous_summary),
+                        _activity_date(summary),
+                    )
+                    if date
+                )
         added = 0
-        for activity in activities:
+        for activity, summary in catalog:
             activity_id = int(activity["id"])
             key = str(activity_id)
             previously_known = (
@@ -185,22 +201,24 @@ class JobStore:
                 or activity_id in excluded
                 or key in pending
             )
-            summary = _catalog_summary(activity)
             previous_summary = pending.get(key) or screened_summaries.get(key)
             if previous_summary is not None and previous_summary != summary:
-                screened.discard(activity_id)
-                screened_summaries.pop(key, None)
                 self.data["checks"].pop(key, None)
                 self.data["reviews"].pop(key, None)
+            day_reopened = _activity_date(summary) in changed_dates
+            if day_reopened:
+                screened.discard(activity_id)
+                screened_summaries.pop(key, None)
             if _is_from_today(activity):
                 screened.discard(activity_id)
                 screened_summaries.pop(key, None)
-            if StravaMerger.is_bot_activity(activity):
+            if StravaMerger.is_bot_activity(activity) and not day_reopened:
                 pending.pop(key, None)
                 screened.discard(activity_id)
                 screened_summaries.pop(key, None)
                 excluded.add(activity_id)
                 continue
+            excluded.discard(activity_id)
             review = self.data["reviews"].get(key)
             if review and _review_needs_rescan(
                 review,
@@ -283,6 +301,9 @@ class JobStore:
         generic_name_patterns: Sequence[str],
     ) -> None:
         key = str(activity["id"])
+        if _is_from_today(activity):
+            self.data["name_reminders"].pop(key, None)
+            return
         if is_generic_activity_name(
             activity.get("name") or "", generic_name_patterns
         ):
@@ -773,7 +794,6 @@ def run_automation(
             continue
         if any(
             "nomerge" in (activity.get("description") or "").lower()
-            or StravaMerger.is_bot_activity(activity)
             for activity in detailed_activities
         ):
             merged_source_ids.difference_update(
@@ -885,8 +905,11 @@ def run_automation(
         ):
             summary.screened_activity_ids.add(activity_id)
             continue
-        should_match_name = is_generic_activity_name(
-            api_activity.get("name") or "", generic_name_patterns
+        should_match_name = (
+            not _is_from_today(api_activity)
+            and is_generic_activity_name(
+                api_activity.get("name") or "", generic_name_patterns
+            )
         )
         ignores_holes = _ignores_hole_detection(
             api_activity, hole_ignored_sport_types
@@ -916,7 +939,8 @@ def run_automation(
             continue
         store.update_name_reminder(api_activity, generic_name_patterns)
         should_match_name = (
-            is_generic_activity_name(
+            not _is_from_today(api_activity)
+            and is_generic_activity_name(
                 api_activity.get("name") or "", generic_name_patterns
             )
             and "nomerge"
@@ -959,7 +983,11 @@ def run_automation(
         replacement.activity = _fixed_activity(
             source,
             len(hole_details),
-            name=merger.fixed_activity_name(source, replacement),
+            name=(
+                source.name
+                if _is_from_today(api_activity)
+                else merger.fixed_activity_name(source, replacement)
+            ),
             hole_details=hole_details,
         )
         job_id = f"fix-{source.id}"
@@ -1275,6 +1303,8 @@ def _auto_rename_activity(
     summary: AutomationSummary,
 ) -> bool:
     """Rename one generic activity when its track touches a configured location."""
+    if _is_from_today(activity):
+        return False
     source = gpx.activity
     new_name = merger.activity_name_for_track(source, gpx)
     if not new_name:
@@ -1345,6 +1375,8 @@ def _refresh_name_reminders(
         else:
             store.update_name_reminder(activity, generic_name_patterns)
             reminder = store.data["name_reminders"].get(str(activity_id), {})
+            if not reminder:
+                continue
             rule_version = getattr(merger, "activity_name_rule_version", None)
             can_auto_rename = all(
                 callable(getattr(merger, method, None))
@@ -2108,12 +2140,13 @@ def _catalog_summary(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _is_from_today(activity: dict[str, Any]) -> bool:
+def _activity_date(activity: dict[str, Any]) -> str | None:
     start_date = activity.get("start_date_local") or activity.get("start_date")
-    return bool(
-        start_date
-        and start_date[:10] == datetime.now().astimezone().date().isoformat()
-    )
+    return start_date[:10] if start_date else None
+
+
+def _is_from_today(activity: dict[str, Any]) -> bool:
+    return _activity_date(activity) == datetime.now().astimezone().date().isoformat()
 
 
 def _hole_repair_summary(hole_details: list[dict[str, Any]]) -> str:
