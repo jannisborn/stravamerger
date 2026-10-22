@@ -35,6 +35,20 @@ GPXTPX_NAMESPACE = "http://www.garmin.com/xmlschemas/TrackPointExtension/v1"
 BOT_MARKER = "StravaMerger bot"
 
 
+def deduplicate_activity_name(
+    name: str,
+    generic_name_patterns: Sequence[str] = DEFAULT_GENERIC_NAME_PATTERNS,
+) -> str:
+    """Remove duplicate and redundant generic merged-name components."""
+    parts = list(dict.fromkeys(part.strip() for part in name.split(" & ")))
+    specific_parts = [
+        part
+        for part in parts
+        if not is_generic_activity_name(part, generic_name_patterns)
+    ]
+    return " & ".join(specific_parts or parts)
+
+
 def _bot_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -677,7 +691,9 @@ class StravaMerger:
             else self.activity_name_for_track(gpx.activity, gpx) or gpx.activity.name
             for gpx in gpx_list
         )
-        name = " & ".join(names)
+        name = deduplicate_activity_name(
+            " & ".join(names), self.generic_name_patterns
+        )
         first_activity, last_activity = gpx_list[0].activity, gpx_list[-1].activity
         chain_gear_ids = {
             gpx.activity.gear_id for gpx in gpx_list if gpx.activity.gear_id
