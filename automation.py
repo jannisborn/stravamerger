@@ -18,7 +18,7 @@ from typing import Any
 import gpxpy
 from loguru import logger
 
-from app import BOT_MARKER, StravaMerger
+from app import BOT_MARKER, StravaMerger, deduplicate_activity_name
 from gpxfixer import (
     MAX_HOLE_DISTANCE,
     GeocodingError,
@@ -434,6 +434,33 @@ def prepare_oldest_activity_batch(
 ) -> tuple[list[dict[str, Any]], set[int]]:
     """Synchronize the catalog and select the oldest unseen daily batch."""
     catalog = merger.get_all_activities()
+    for activity in catalog:
+        name = activity.get("name") or ""
+        normalized_name = deduplicate_activity_name(
+            name,
+            getattr(
+                merger,
+                "generic_name_patterns",
+                DEFAULT_GENERIC_NAME_PATTERNS,
+            ),
+        )
+        if normalized_name != name and StravaMerger.is_bot_activity(activity):
+            applied, error = merger.update_activity_name(
+                activity["id"], normalized_name
+            )
+            if applied:
+                activity["name"] = normalized_name
+                logger.info(
+                    'Renamed duplicate merged title "{}" to "{}".',
+                    name,
+                    normalized_name,
+                )
+            else:
+                logger.warning(
+                    'Could not normalize merged title "{}": {}.',
+                    name,
+                    error or "unknown error",
+                )
     if not store.scan_initialized:
         added = store.sync_catalog(
             catalog,
@@ -1637,6 +1664,17 @@ def _upload_jobs(
         if job["kind"] == "fix":
             source = Activity(**job["sources"][0])
             name = merger.fixed_activity_name(source, gpx)
+            gpx.activity.name = name
+            job["replacement"]["name"] = name
+        else:
+            name = deduplicate_activity_name(
+                gpx.activity.name,
+                getattr(
+                    merger,
+                    "generic_name_patterns",
+                    DEFAULT_GENERIC_NAME_PATTERNS,
+                ),
+            )
             gpx.activity.name = name
             job["replacement"]["name"] = name
     for job_id, gpx in zip(job_ids, gpxs):
