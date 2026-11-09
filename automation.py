@@ -192,6 +192,14 @@ class JobStore:
                     )
                     if date
                 )
+            elif not initialize and (
+                int(activity["id"]) not in screened
+                and int(activity["id"]) not in excluded
+                and key not in pending
+            ):
+                date = _activity_date(summary)
+                if date:
+                    changed_dates.add(date)
         added = 0
         for activity, summary in catalog:
             activity_id = int(activity["id"])
@@ -415,7 +423,7 @@ class JobStore:
                     self.data,
                     file,
                     ensure_ascii=False,
-                    separators=(",", ":"),
+                    indent=2,
                 )
                 file.write("\n")
             os.replace(temporary_path, self.path)

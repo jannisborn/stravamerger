@@ -97,6 +97,8 @@ class AutomationStateTests(unittest.TestCase):
         self.assertEqual(loaded_gpx.activity.external_id, "stravamerger-fix-123-v1")
         with open(state_path) as file:
             self.assertEqual(json.load(file)["version"], 1)
+        with open(state_path) as file:
+            self.assertIn('\n  "version": 1,', file.read())
         email_body = _delete_mail_body([loaded_store.jobs["fix-123"]])
         self.assertIn("Ride", email_body)
         self.assertIn("1 GPS hole found", email_body)
@@ -250,7 +252,7 @@ class AutomationStateTests(unittest.TestCase):
         state_path = os.path.join(self.temporary_directory.name, "history.json")
         JobStore(state_path).sync_catalog(activities, initialize=True)
 
-        self.assertLess(os.path.getsize(state_path), 1_000_000)
+        self.assertLess(os.path.getsize(state_path), 1_100_000)
 
     def test_pending_catalog_metadata_is_refreshed(self):
         state_path = os.path.join(self.temporary_directory.name, "history.json")
@@ -337,6 +339,35 @@ class AutomationStateTests(unittest.TestCase):
         )
         self.assertFalse(store.was_checked_clean(1))
         self.assertIsNone(store.review_reason(1))
+
+    def test_new_activity_requeues_screened_activities_from_same_day(self):
+        state_path = os.path.join(self.temporary_directory.name, "history.json")
+        existing = {
+            "id": 1,
+            "name": "Morning ride",
+            "start_date_local": "2020-01-01T09:00:00Z",
+            "sport_type": "Ride",
+        }
+        other_day = {
+            "id": 2,
+            "name": "Next-day ride",
+            "start_date_local": "2020-01-02T09:00:00Z",
+            "sport_type": "Ride",
+        }
+        store = JobStore(state_path)
+        store.sync_catalog([existing, other_day], initialize=True)
+        store.record_screened({1, 2})
+
+        new_activity = {
+            "id": 3,
+            "name": "Evening ride",
+            "start_date_local": "2020-01-01T17:00:00Z",
+            "sport_type": "Ride",
+        }
+        store.sync_catalog([existing, other_day, new_activity])
+
+        self.assertEqual(store.data["scan"]["screened_ids"], [2])
+        self.assertEqual(set(store.data["scan"]["pending"]), {"1", "3"})
 
     def test_legacy_review_is_requeued_for_structured_hole_details(self):
         state_path = os.path.join(self.temporary_directory.name, "history.json")
